@@ -1,5 +1,11 @@
 import os
 
+from dotenv import load_dotenv
+
+# Load .env into the environment when the worker config is first imported, so the
+# lazy properties below find the keys. No-op if there's no .env (tests / CI).
+load_dotenv()
+
 
 class Settings:
     """Lazy config. Required keys are read on ACCESS, not at import — so importing
