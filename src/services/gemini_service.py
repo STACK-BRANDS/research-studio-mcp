@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = None
 
 # Model used for video analysis (Gemini 2.0 Flash is more cost-effective than Pro)
-GEMINI_MODEL = "gemini-2.0-flash-exp"
+# The experimental "-exp" models get retired and 404. Use a current stable multimodal model;
+# override via GEMINI_MODEL env if Google rotates names again.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Type alias for uploaded files (new google-genai SDK)
 File = types.File

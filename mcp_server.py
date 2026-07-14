@@ -1,4 +1,4 @@
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from src.services.scrapecreators_service import get_platform_id, get_ads, get_scrapecreators_api_key, get_platform_ids_batch, get_ads_batch, CreditExhaustedException, RateLimitException
 from src.services.media_cache_service import media_cache, image_cache  # Keep image_cache for backward compatibility
 from src.services.gemini_service import configure_gemini, upload_video_to_gemini, analyze_video_with_gemini, cleanup_gemini_file, analyze_videos_batch_with_gemini, upload_videos_batch_to_gemini, cleanup_gemini_files_batch
@@ -425,15 +425,16 @@ def analyze_ad_image(media_urls: Union[str, List[str]], brand_name: Optional[str
                 "error": "Empty media_urls list"
             }
         if len(media_urls) > 1:
-            batch = [analyze_ad_image(u, brand_name=brand_name, ad_id=ad_id) for u in media_urls]
-            return {
-                "success": all(b.get("success") for b in batch),
-                "message": f"Batch analyzed {len(batch)} image(s).",
-                "batch_info": {"count": len(batch)},
-                "total_processed": sum(1 for b in batch if b.get("success")),
-                "results": batch,
-                "error": None
-            }
+            # Each single call returns [Image, note] on success or an error dict. Flatten into
+            # one content list so Claude receives real image blocks (not base64 text).
+            out = []
+            for u in media_urls:
+                r = analyze_ad_image(u, brand_name=brand_name, ad_id=ad_id)
+                if isinstance(r, list):
+                    out.extend(r)
+                else:
+                    out.append(r)
+            return out
         media_url = media_urls[0]
     else:
         media_url = media_urls
@@ -471,14 +472,16 @@ def analyze_ad_image(media_urls: Union[str, List[str]], brand_name: Optional[str
         
         # Determine if we need to download
         image_data = None
+        raw_bytes = None
         content_type = None
         file_size = None
-        
+
         if cached_data:
             # Image is cached but no analysis results yet
             try:
                 with open(cached_data['file_path'], 'rb') as f:
                     image_bytes = f.read()
+                raw_bytes = image_bytes
                 image_data = base64.b64encode(image_bytes).decode('utf-8')
                 content_type = cached_data['content_type']
                 file_size = cached_data['file_size']
@@ -513,87 +516,31 @@ def analyze_ad_image(media_urls: Union[str, List[str]], brand_name: Optional[str
             )
             
             # Encode for analysis
+            raw_bytes = response.content
             image_data = base64.b64encode(response.content).decode('utf-8')
             file_size = len(response.content)
         
-        # Construct comprehensive analysis prompt - let Claude Desktop control presentation
-        analysis_prompt = """
-Analyze this Facebook ad image and extract ALL factual information about:
+        # Return REAL image content so Claude can actually see and analyze it. Returning base64
+        # in a JSON field (the upstream design) is not vision-analyzable and blows the token
+        # limit; FastMCP Image content becomes an image block the model can read.
+        if raw_bytes is None and image_data:
+            raw_bytes = base64.b64decode(image_data)
 
-**Overall Visual Description:**
-- Complete description of what is shown in the image
-
-**Text Elements:**
-- Identify and transcribe ALL text present in the image
-- Categorize each text element as:
-  * "Headline Hook" (designed to grab attention)
-  * "Value Proposition" (explains the benefit to the viewer)
-  * "Call to Action (CTA)" (tells the viewer what to do next)
-  * "Referral" (prompts the viewer to share the product)
-  * "Disclaimer" (legal text, terms, conditions)
-  * "Brand Name" (company or product names)
-  * "Other" (any other text)
-
-**People Description:**
-- For each person visible: age range, gender, appearance, clothing, pose, facial expression, setting
-
-**Brand Elements:**
-- Logos present (describe and position)
-- Product shots (describe what products are shown)
-- Brand colors or visual identity elements
-
-**Composition & Layout:**
-- Layout structure (grid, asymmetrical, centered, etc.)
-- Visual hierarchy (what draws attention first, second, third)
-- Element positioning (top-left, center, bottom-right, etc.)
-- Text overlay vs separate text areas
-- Use of composition techniques (rule of thirds, leading lines, symmetry, etc.)
-
-**Colors & Visual Style:**
-- List ALL dominant colors (specific color names or hex codes if possible)
-- Background color/type and style
-- Photography style (professional, candid, studio, lifestyle, etc.)
-- Any filters, effects, or styling applied
-
-**Technical & Target Audience Indicators:**
-- Image format and aspect ratio
-- Text readability and contrast
-- Overall image quality
-- Visual cues about target audience (age, lifestyle, interests, demographics)
-- Setting/environment details
-
-**Message & Theme:**
-- What story or message the visual conveys
-- Emotional tone and mood
-- Marketing strategy indicators
-
-Extract ALL this information comprehensively. The presentation format (summary vs detailed breakdown) will be determined based on the user's specific request context.
-"""
-        
-        # Return simplified response for Claude Desktop to process
-        # Include the image data directly for Claude's vision analysis
-        response = {
-            "success": True,
-            "message": f"Image downloaded and ready for analysis.",
-            "cached": bool(cached_data),
-            "image_data": image_data,
-            "media_url": media_url,
-            "brand_name": brand_name,
-            "ad_id": ad_id,
-            "analysis_instructions": analysis_prompt,
-            "ad_library_url": "https://www.facebook.com/ads/library/",
-            "source_citation": f"[Facebook Ad Library - {brand_name if brand_name else 'Ad'} #{ad_id if ad_id else 'Unknown'}]({media_url})",
-            "error": None
-        }
-        
-        # Add cache info
-        if cached_data:
-            response["cache_status"] = "Used cached image"
+        ct = (content_type or "").lower()
+        if "png" in ct:
+            fmt = "png"
+        elif "webp" in ct:
+            fmt = "webp"
+        elif "gif" in ct:
+            fmt = "gif"
         else:
-            response["cache_status"] = "Downloaded and cached new image"
-            
-        return response
-        
+            fmt = "jpeg"
+
+        citation = f"[Facebook Ad Library - {brand_name if brand_name else 'Ad'} #{ad_id if ad_id else 'Unknown'}]({media_url})"
+        note = (f"Ad image ready for visual analysis. brand={brand_name or 'n/a'}, "
+                f"ad_id={ad_id or 'n/a'}, source={media_url}. Citation: {citation}")
+        return [Image(data=raw_bytes, format=fmt), note]
+
     except requests.exceptions.RequestException as e:
         return {
             "success": False,
