@@ -19,6 +19,62 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 # Type alias for uploaded files (new google-genai SDK)
 File = types.File
 
+# Google rotates/retires Gemini model names constantly (gemini-2.0-flash-exp got 404'd;
+# gemini-2.5-flash came back "no longer available to new users"). Instead of hardcoding one
+# name, try a fallback chain and cache the first that works on THIS key.
+_MODEL_CANDIDATES = [
+    "gemini-2.5-flash-002",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+    "gemini-1.5-flash-002",
+    "gemini-1.5-flash",
+]
+# Error fragments that mean "this model name won't work — try the next one".
+_MODEL_MISS = ("not found", "not available", "no longer available", "does not exist",
+               "unsupported", "invalid model", "404", "permission")
+_RESOLVED_MODEL = None
+
+
+def _model_order():
+    """Candidate models: the GEMINI_MODEL env override first (if set), then the chain."""
+    order = []
+    if _RESOLVED_MODEL:
+        order.append(_RESOLVED_MODEL)
+    env = os.getenv("GEMINI_MODEL")
+    if env:
+        order.append(env)
+    order.extend(_MODEL_CANDIDATES)
+    seen, out = set(), []
+    for m in order:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def generate_with_fallback(client, contents):
+    """generate_content that walks the candidate models until one is available on this key.
+    Caches the winner for the rest of the process. Re-raises non-model errors immediately."""
+    global _RESOLVED_MODEL
+    last_err, tried = None, []
+    for model in _model_order():
+        try:
+            resp = client.models.generate_content(model=model, contents=contents)
+            if _RESOLVED_MODEL != model:
+                logger.info(f"Gemini video model resolved to '{model}'")
+                _RESOLVED_MODEL = model
+            return resp
+        except Exception as e:
+            tried.append(model)
+            last_err = e
+            if any(frag in str(e).lower() for frag in _MODEL_MISS):
+                logger.warning(f"Gemini model '{model}' unavailable, trying next")
+                continue
+            raise
+    raise Exception(f"No available Gemini model on this key. Tried: {tried}. Last error: {last_err}")
+
 def get_gemini_api_key() -> str:
     """
     Get Gemini API key from command line arguments or environment variable.
@@ -120,10 +176,7 @@ def analyze_video_with_gemini(client: genai.Client, video_file: File, prompt: st
     """
     try:
         # Generate analysis
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[video_file, prompt],
-        )
+        response = generate_with_fallback(client, [video_file, prompt])
 
         if not response.text:
             raise Exception("Gemini returned empty response")
@@ -175,10 +228,7 @@ Please analyze each video separately and clearly label each analysis as "VIDEO 1
         content_parts = [batch_prompt] + video_files
 
         # Generate batch analysis
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=content_parts,
-        )
+        response = generate_with_fallback(client, content_parts)
 
         if not response.text:
             raise Exception("Gemini returned empty response for batch analysis")
