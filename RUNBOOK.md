@@ -16,6 +16,17 @@ cd research-studio-mcp
 ✅ Success: a `venv/` folder exists and the script prints an MCP config block ending with the
 path to `mcp_server.py`.
 
+**Requires Python 3.12+.** `install.sh` uses whatever `python3` is on PATH; if that is 3.9/3.11
+the deps fail (e.g. `click==8.2.1` needs ≥3.10). Build the venv with a 3.12 interpreter instead:
+```bash
+rm -rf venv
+python3.12 -m venv venv          # or the full path, e.g. ~/.local/bin/python3.12
+./venv/bin/python -m pip install --upgrade pip
+./venv/bin/pip install -r requirements.txt
+./venv/bin/python -c "import mcp, dotenv, requests; print('imports OK')"
+```
+✅ Success: `imports OK`. The `venv/bin/python` this creates is the `command` path used in step 3.
+
 ### 2. Note your project path
 ```bash
 pwd
