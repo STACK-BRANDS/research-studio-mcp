@@ -15,8 +15,13 @@ you actually retrieve — no assumptions from prior knowledge of the brand.
    the official brand page and state which platform_id you chose and why.
 2. Call `get_meta_ads` with that `platform_ids`, `limit={{LIMIT}}`, `country="{{COUNTRY}}"`,
    `trim=false`. If zero ads return, say so plainly and stop — do not invent a playbook.
-3. For the visually-driven ads, call `analyze_ad_image` on the `media_url` (and
-   `analyze_ad_video` only if video analysis is enabled) so image/video claims are grounded.
+3. **Deduplicate to distinct creatives first** (collapse DCO/multi-image variants of the same
+   ad_id + same copy into one). Then call `analyze_ad_image` on **at most ONE representative
+   image per distinct creative, capped at 8 images total** — pick the longest-running / most
+   duplicated concepts. Do NOT analyze every raw ad or every variant: analyzing dozens of
+   images in one turn stalls the whole run. If there are more than 8 distinct creatives, say
+   which ones you analyzed and which you skipped. Use `analyze_ad_video` only if a Gemini key
+   is configured, and on at most 2 videos.
 
 ## Output
 
@@ -48,3 +53,6 @@ social proof, comparison, UGC). Cite examples.
 - Every claim cites ad_id(s) or a quoted hook line. No uncited generalizations.
 - If the sample is thin (< 8 ads), label the playbook "low-confidence, small sample" and say so.
 - Report the `credit_info`/`count` the tool returned so credit burn is visible.
+- **Bound the image analysis to ≤8 images (one per distinct creative).** Never fan out
+  `analyze_ad_image` over all raw ads — it makes the run take an hour and bloats context. The
+  copy-level playbook (table + plays) is the priority; visuals enrich the top concepts only.
