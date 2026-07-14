@@ -411,7 +411,34 @@ def analyze_ad_image(media_urls: Union[str, List[str]], brand_name: Optional[str
         - analysis_instructions: Detailed prompt for objective visual analysis
         - error: Error details if processing failed
     """
-    if not media_url or not media_url.strip():
+    # Fix: the signature is `media_urls` (str | list) but the single-URL body below
+    # references `media_url` (upstream never migrated the body). Normalize here; handle a
+    # list by analyzing each URL and aggregating, so no URLs are silently dropped.
+    if isinstance(media_urls, (list, tuple)):
+        if not media_urls:
+            return {
+                "success": False,
+                "message": "media_urls list is empty.",
+                "cached": False,
+                "analysis": {},
+                "cache_info": {},
+                "error": "Empty media_urls list"
+            }
+        if len(media_urls) > 1:
+            batch = [analyze_ad_image(u, brand_name=brand_name, ad_id=ad_id) for u in media_urls]
+            return {
+                "success": all(b.get("success") for b in batch),
+                "message": f"Batch analyzed {len(batch)} image(s).",
+                "batch_info": {"count": len(batch)},
+                "total_processed": sum(1 for b in batch if b.get("success")),
+                "results": batch,
+                "error": None
+            }
+        media_url = media_urls[0]
+    else:
+        media_url = media_urls
+
+    if not media_url or not str(media_url).strip():
         return {
             "success": False,
             "message": "Media URL must be provided and cannot be empty.",
@@ -420,7 +447,7 @@ def analyze_ad_image(media_urls: Union[str, List[str]], brand_name: Optional[str
             "cache_info": {},
             "error": "Missing or empty media URL"
         }
-    
+
     try:
         # Check cache first
         cached_data = image_cache.get_cached_image(media_url.strip())
