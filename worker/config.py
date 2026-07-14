@@ -1,12 +1,38 @@
 import os
 
+
 class Settings:
-    anthropic_api_key = os.environ["ANTHROPIC_API_KEY"]
-    scrapecreators_api_key = os.environ["SCRAPECREATORS_API_KEY"]
-    supabase_url = os.environ["SUPABASE_URL"]
-    supabase_service_key = os.environ["SUPABASE_SERVICE_KEY"]  # sb_secret_ (new key)
-    model = os.getenv("RESEARCH_MODEL", "claude-sonnet-5")
-    max_images = int(os.getenv("RESEARCH_MAX_IMAGES", "8"))
-    ad_limit = int(os.getenv("RESEARCH_AD_LIMIT", "25"))
+    """Lazy config. Required keys are read on ACCESS, not at import — so importing
+    worker.* (tests, tooling) never requires the full server-side env, only actually
+    running the worker does."""
+
+    @property
+    def anthropic_api_key(self) -> str:
+        return os.environ["ANTHROPIC_API_KEY"]
+
+    @property
+    def scrapecreators_api_key(self) -> str:
+        return os.environ["SCRAPECREATORS_API_KEY"]
+
+    @property
+    def supabase_url(self) -> str:
+        return os.environ["SUPABASE_URL"]
+
+    @property
+    def supabase_service_key(self) -> str:  # sb_secret_ (new key)
+        return os.environ["SUPABASE_SERVICE_KEY"]
+
+    @property
+    def model(self) -> str:
+        return os.getenv("RESEARCH_MODEL", "claude-sonnet-5")
+
+    @property
+    def max_images(self) -> int:
+        return int(os.getenv("RESEARCH_MAX_IMAGES", "8"))
+
+    @property
+    def ad_limit(self) -> int:
+        return int(os.getenv("RESEARCH_AD_LIMIT", "25"))
+
 
 settings = Settings()
