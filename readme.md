@@ -2,6 +2,11 @@
 
 # Facebook Ads Library MCP Server
 
+> **STACK BRANDS fork (`research-studio-mcp`).** This is the Research Studio ingestion layer.
+> For our setup, the analyst prompt-pack, and the Phase-1 validation, read **`RUNBOOK.md`**,
+> **`CLAUDE.md`**, and **`prompts/`** — not the upstream instructions below. Spec lives in
+> `command-center/docs/superpowers/specs/2026-07-14-research-studio-design.md`.
+
 This is a Model Context Protocol (MCP) server for the Facebook Ads Library.
 
 With this you can search Facebook's public ads library for any company or brand, see what they're currently running and analyze their advertising. You can analyze ad images/text, analyze video ads with comprehensive insights, compare companies' strategies, and get insights into what's working in their campaigns.

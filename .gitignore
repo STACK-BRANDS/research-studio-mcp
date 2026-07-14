@@ -23,7 +23,7 @@ mcp-inspector-config.json
 
 # Claude Code working directory (contains local tasks and hooks)
 .claude/
-CLAUDE.md
+# NOTE: upstream ignored CLAUDE.md; STACK BRANDS commits ours (repo lane) — do not re-add.
 
 # IDE and editor files
 .vscode/
