@@ -18,6 +18,12 @@ from worker.spend_guard import ResearchSpendCapExceeded
 
 def main(brand: str, domain: Optional[str] = None) -> None:
     comp_id = store.get_or_create_competitor(brand, domain)
+    # Record the run as STARTED before any expensive work (pull_ads/analysis), so a
+    # run stuck mid-flight (crash, hang, spend cap trip) is visible in research_runs
+    # rather than invisible until save_analysis lands at the end (the 2026-07 cost
+    # incident: nothing was written until the terminal save_analysis). Best-effort —
+    # store.start_run never raises; run_id is None if the registry write failed.
+    run_id = store.start_run(brand, comp_id)
     platform_id = ingest.resolve_platform_id(brand)
     # Pull wide + dedup; the SNAPSHOT keeps everything (spec §9). The expensive
     # analysis runs on a scope-aware sample (active-first, recency+longevity).
@@ -34,6 +40,7 @@ def main(brand: str, domain: Optional[str] = None) -> None:
             status="no_ads",
             error="Resolved page returned no active ads — try the exact ad-running page name.",
         )
+        store.finish_run(run_id, "no_ads", scraped_ads=0, analyzed=0, est_claude_calls=0)
         print(f"no ads for {brand}: resolved page has no active ads — try the exact ad-running page name", file=sys.stderr)
         return
 
@@ -50,6 +57,7 @@ def main(brand: str, domain: Optional[str] = None) -> None:
         meta["images_analyzed"] = len(images)
         result = analyze.analyze(brand, sample, images, scraped_count=len(raw))
         store.save_analysis(comp_id, snap_id, result, meta, status="ok")
+        store.finish_run(run_id, "done", scraped_ads=len(raw), analyzed=len(sample), est_claude_calls=1)
         proposals = len(result.get("proposed_research", []))
         print(
             f"saved analysis for {brand}: {len(sample)} of {len(raw)} ads analyzed, "
@@ -66,6 +74,13 @@ def main(brand: str, domain: Optional[str] = None) -> None:
         # latter, str(exc) already carries the specific reason -- e.g. for
         # "corrupt" it names the unreadable state file and how to reset it
         # -- so print it directly instead of the count/limit template.
+        store.finish_run(
+            run_id, "capped",
+            scraped_ads=len(raw) if "raw" in locals() else None,
+            analyzed=len(sample) if "sample" in locals() else None,
+            est_claude_calls=0,
+            error=str(exc),
+        )
         if exc.window in ("hour", "day"):
             print(
                 f"spend cap hit ({exc.count}/{exc.limit} this {exc.window}) — not calling Claude "
@@ -77,6 +92,13 @@ def main(brand: str, domain: Optional[str] = None) -> None:
         sys.exit(1)
     except Exception as exc:  # noqa: BLE001 — always record an observable row (Codex P2-1)
         store.save_analysis(comp_id, snap_id, {}, meta, status="failed", error=str(exc))
+        store.finish_run(
+            run_id, "failed",
+            scraped_ads=len(raw) if "raw" in locals() else None,
+            analyzed=len(sample) if "sample" in locals() else None,
+            est_claude_calls=1,
+            error=str(exc),
+        )
         print(f"analysis FAILED for {brand} (snapshot saved): {exc}", file=sys.stderr)
         traceback.print_exc()
         raise
