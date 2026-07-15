@@ -38,13 +38,17 @@ def analyze(
         content.append({"type": "image", "source": {
             "type": "base64", "media_type": mtype,
             "data": base64.b64encode(raw).decode()}})
-    resp = client.messages.create(
+    # Stream with a generous budget: sonnet-5 runs adaptive thinking by default, and
+    # max_tokens caps thinking + output together — 16k truncated the JSON on large
+    # analyses. 32k leaves room for both; streaming avoids HTTP timeouts at that size.
+    with client.messages.stream(
         model=settings.model,
-        max_tokens=16000,
+        max_tokens=32000,
         system=SYSTEM,
         output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
         messages=[{"role": "user", "content": content}],
-    )
+    ) as stream:
+        resp = stream.get_final_message()
     import json
     text = "".join(b.text for b in resp.content if b.type == "text")
     return json.loads(text)

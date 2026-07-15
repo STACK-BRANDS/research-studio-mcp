@@ -1,15 +1,13 @@
-from worker.ingest import dedup
+import time
+
+from worker.ingest import dedup, select_for_analysis
+
 
 def test_dedup_collapses_same_adid():
     ads = [{"ad_id": "1", "text": "a"}, {"ad_id": "1", "text": "a"}, {"ad_id": "2", "text": "b"}]
     out = dedup(ads)
     assert len(out) == 2
     assert {a["ad_id"] for a in out} == {"1", "2"}
-
-
-import time
-
-from worker.ingest import select_for_analysis
 
 
 def test_select_returns_all_when_small():

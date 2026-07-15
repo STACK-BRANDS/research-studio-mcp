@@ -99,13 +99,20 @@ def _parse_dt(v):
         return None
     try:
         if isinstance(v, (int, float)):
-            return datetime.fromtimestamp(float(v), tz=timezone.utc)
-        s = str(v).strip()
-        if s.isdigit():
-            return datetime.fromtimestamp(int(s), tz=timezone.utc)
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            dt = datetime.fromtimestamp(float(v), tz=timezone.utc)
+        else:
+            s = str(v).strip()
+            if s.isdigit():
+                dt = datetime.fromtimestamp(int(s), tz=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except (ValueError, OverflowError, OSError):
         return None
+    # Always return timezone-aware UTC — an ISO string without an offset parses
+    # naive, which would break comparisons against datetime.now(timezone.utc).
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _first(ad: dict, fields):
