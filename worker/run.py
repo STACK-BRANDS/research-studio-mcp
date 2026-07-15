@@ -61,10 +61,11 @@ def main(brand: str, domain: Optional[str] = None) -> None:
         # clearly and exit non-zero without calling Claude.
         #
         # `exc.window` is "hour"/"day" for a real cap hit (count/limit are
-        # meaningful) or "lock"/"persist" for a fail-closed guard-
+        # meaningful) or "lock"/"persist"/"corrupt" for a fail-closed guard-
         # infrastructure failure (count/limit are placeholders); for the
-        # latter, str(exc) already carries the specific reason, so print it
-        # directly instead of the count/limit template.
+        # latter, str(exc) already carries the specific reason -- e.g. for
+        # "corrupt" it names the unreadable state file and how to reset it
+        # -- so print it directly instead of the count/limit template.
         if exc.window in ("hour", "day"):
             print(
                 f"spend cap hit ({exc.count}/{exc.limit} this {exc.window}) — not calling Claude "

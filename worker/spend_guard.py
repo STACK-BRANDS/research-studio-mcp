@@ -16,8 +16,16 @@ state file (a flat list of unix-time floats) next to the worker, keyed by
 `RESEARCH_SPEND_STATE_FILE` (default `~/.research-studio-mcp/spend_window.json`).
 Load -> prune (>24h) -> count -> decide -> append -> save, all inside `guard()`.
 
-Robustness: a missing/corrupt state file on LOAD is treated as an empty
-window (log-and-continue, never crash the worker over unreadable data).
+Robustness: a genuinely MISSING state file on LOAD (first run, nothing
+written yet) is treated as an empty window -- there is no prior spend to
+verify, so the call is allowed. But a state file that EXISTS and cannot be
+read or parsed (corrupt JSON, wrong shape, permission denied) is a different
+case entirely: it means there IS prior spend on disk that we can no longer
+see. Treating that as "empty" would silently reset a capped window and let
+a call through despite unknown prior spend -- exactly the fail-open hole
+this guard exists to close. So an existing-but-unreadable state file FAILS
+CLOSED too: `guard()` raises `ResearchSpendCapExceeded` (window="corrupt")
+rather than resetting the window and proceeding.
 But the durable append+save is a PRECONDITION for allowing the call, not a
 best-effort afterthought: since each fresh CLI process reloads the window
 solely from disk and makes exactly one guarded call, a write failure that
@@ -75,8 +83,8 @@ class ResearchSpendCapExceeded(BaseException):
     a failed analysis).
 
     `window` is one of `"hour"` / `"day"` for a real cap hit, or `"lock"` /
-    `"persist"` for a fail-closed guard-infrastructure failure -- callers that
-    branch on `window` can tell the two apart. `reason`, when given,
+    `"persist"` / `"corrupt"` for a fail-closed guard-infrastructure failure
+    -- callers that branch on `window` can tell the two apart. `reason`, when given,
     overrides the default cap-hit message with an explicit explanation of
     *why* the call was blocked (so "state persistence failed" never looks
     like an ordinary cap hit in logs).
@@ -93,25 +101,30 @@ class ResearchSpendCapExceeded(BaseException):
         super().__init__(message)
 
 
+class _StateFileUnreadable(Exception):
+    """Internal signal: the state file EXISTS but could not be read/parsed
+    (corrupt JSON, wrong shape, permission denied, etc). Distinct from a
+    genuinely missing file -- `guard()` catches this and fails closed
+    (`window="corrupt"`) rather than treating it as an empty window."""
+
+
 def _load(path: str) -> list:
     try:
         with open(path) as f:
             data = json.load(f)
-        if not isinstance(data, list):
-            return []
-        return [float(t) for t in data]
     except FileNotFoundError:
+        # Genuinely no state file yet: legitimate first run, nothing to be
+        # cautious about -- an empty window is correct, not a fail-open hole.
         return []
     except (json.JSONDecodeError, ValueError, TypeError, OSError) as exc:
-        # Corrupt/unreadable state file: never crash the worker over this --
-        # treat it as an empty window and keep going.
-        print(f"spend_guard: could not read state file {path} ({exc}); treating as empty", file=_stderr())
-        return []
+        raise _StateFileUnreadable(str(exc)) from exc
 
-
-def _stderr():
-    import sys
-    return sys.stderr
+    if not isinstance(data, list):
+        raise _StateFileUnreadable(f"state file {path} does not contain a JSON list")
+    try:
+        return [float(t) for t in data]
+    except (TypeError, ValueError) as exc:
+        raise _StateFileUnreadable(str(exc)) from exc
 
 
 def _save(path: str, calls: list) -> None:
@@ -125,6 +138,15 @@ def _save(path: str, calls: list) -> None:
     `OSError` here as a precondition failure and fails the call closed --
     see the module docstring for why persistence must be a precondition,
     not an afterthought, for a one-call-per-process CLI.
+
+    After the rename, also `fsync` the parent directory itself. On POSIX,
+    `os.replace`'s rename is only guaranteed durable across a crash/power
+    loss once the directory entry change is fsynced -- without this, a
+    crash right after `os.replace` could leave the rename un-persisted in
+    the directory's metadata even though the file content was fsynced.
+    This directory fsync is best-effort only (some filesystems/platforms
+    don't support fsyncing a directory fd): a failure here does NOT fail
+    the call closed, unlike a genuine write/replace failure above.
     """
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
@@ -141,6 +163,20 @@ def _save(path: str, calls: list) -> None:
         except OSError:
             pass  # best-effort cleanup only; the original OSError still propagates
         raise
+
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Best-effort only: some filesystems/platforms can't fsync a
+        # directory fd at all. The rename itself already succeeded and its
+        # content is durable; not being able to additionally fsync the
+        # directory entry is a narrower, non-fatal gap -- it must not
+        # spuriously block an otherwise-successful save.
+        pass
 
 
 def _acquire_lock(lock_path: str):
@@ -226,7 +262,18 @@ def guard(now: float | None = None, state_path: str | None = None) -> None:
         ) from exc
 
     try:
-        calls = _prune(_load(path), now)
+        try:
+            calls = _prune(_load(path), now)
+        except _StateFileUnreadable as exc:
+            raise ResearchSpendCapExceeded(
+                "corrupt", 0, 0,
+                reason=(
+                    f"Research spend guard: state file {path} exists but is unreadable or "
+                    f"corrupt ({exc}); prior spend cannot be verified, so analysis is blocked "
+                    f"(fail closed) -- resetting to an empty window would silently erase "
+                    f"unknown prior spend. Inspect (or delete, to reset the window) {path}."
+                ),
+            ) from exc
 
         in_hour = _count_within(calls, now, _HOUR)
         in_day = _count_within(calls, now, _DAY)

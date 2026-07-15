@@ -125,21 +125,62 @@ def test_missing_state_file_treated_as_empty(state_file):
     assert snap["calls_last_day"] == 0
 
 
-def test_corrupt_state_file_treated_as_empty_no_crash(monkeypatch, state_file):
+def test_missing_state_file_still_allows_first_call(monkeypatch, state_file):
+    """P1: a genuinely ABSENT state file (nothing written yet, e.g. the very
+    first run on a fresh machine) must NOT be over-tightened into fail-closed
+    -- there is no unknown prior spend to be cautious about, so the call is
+    allowed and an empty window is legitimate."""
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_HOUR", "20")
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_DAY", "80")
+    assert not os.path.exists(state_file)
+
+    guard(now=6_000_000.0, state_path=state_file)  # must not raise
+
+    snap = snapshot(now=6_000_000.0, state_path=state_file)
+    assert snap["calls_last_hour"] == 1
+    with open(state_file) as f:
+        data = json.load(f)
+    assert data == [6_000_000.0]
+
+
+def test_corrupt_existing_state_file_fails_closed(monkeypatch, state_file):
+    """P1: unlike a genuinely missing file, a state file that EXISTS but
+    can't be read/parsed means there IS prior spend on disk we can no longer
+    see. Resetting that to an empty window (the old behavior) silently lets
+    a call through despite unknown prior spend -- the fail-open hole this
+    guard exists to close. guard() must instead fail CLOSED with a distinct
+    window="corrupt", and must NOT reset/overwrite the file or allow the call."""
     monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_HOUR", "20")
     monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_DAY", "80")
     with open(state_file, "w") as f:
         f.write("{not valid json[")
 
-    # Must not raise a JSON/parsing error -- treated as an empty window.
-    guard(now=6_000_000.0, state_path=state_file)
-    snap = snapshot(now=6_000_000.0, state_path=state_file)
-    assert snap["calls_last_hour"] == 1
+    with pytest.raises(ResearchSpendCapExceeded) as exc:
+        guard(now=6_100_000.0, state_path=state_file)
 
-    # File is now valid JSON again (guard() overwrote it on save).
+    assert exc.value.window == "corrupt"
+    msg = str(exc.value).lower()
+    assert "unreadable" in msg or "corrupt" in msg
+    assert state_file in str(exc.value)
+
+    # Must NOT have reset/overwritten the corrupt file -- it's untouched,
+    # so the operator can still inspect what was there.
     with open(state_file) as f:
-        data = json.load(f)
-    assert data == [6_000_000.0]
+        assert f.read() == "{not valid json["
+
+
+def test_corrupt_existing_state_file_via_wrong_json_shape_fails_closed(monkeypatch, state_file):
+    """A state file that parses as valid JSON but isn't the expected flat
+    list shape (e.g. an object) is just as unreadable for our purposes as
+    malformed JSON -- must also fail closed, not silently coerce to empty."""
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_HOUR", "20")
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_DAY", "80")
+    with open(state_file, "w") as f:
+        json.dump({"unexpected": "shape"}, f)
+
+    with pytest.raises(ResearchSpendCapExceeded) as exc:
+        guard(now=6_200_000.0, state_path=state_file)
+    assert exc.value.window == "corrupt"
 
 
 def test_write_failure_fails_closed(monkeypatch, state_file):
