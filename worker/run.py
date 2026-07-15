@@ -127,6 +127,11 @@ def main(brand: str, domain: Optional[str] = None) -> None:
         # (early return, sys.exit in the capped branch, or the re-raise here)
         # regardless of whether save_analysis succeeded.
         store.finish_run(run_id, status, scraped_ads=scraped, analyzed=analyzed, est_claude_calls=est_calls, error=err)
+        # Fleet usage: flush whatever analyze.usage buffered this run (a
+        # no-op if the reporter is in no-op mode or nothing was buffered).
+        # UsageReporter.flush() never raises -- see its module docstring --
+        # so this cannot mask the run's actual outcome/exception above.
+        analyze.usage.flush()
 
 
 if __name__ == "__main__":

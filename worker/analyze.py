@@ -2,6 +2,12 @@ from anthropic import Anthropic
 from worker import spend_guard
 from worker.config import settings
 from worker.schema import ANALYSIS_SCHEMA
+from worker.usage_reporter import UsageReporter
+
+# Fleet usage reporter (constructed once per process). No-op unless
+# USAGE_INGEST_URL/USAGE_INGEST_TOKEN are set -- never raises, never blocks
+# analyze(). worker.run.main() flushes this at the end of every run.
+usage = UsageReporter(system="research", repo="research-studio-mcp")
 
 SYSTEM = (
     "You are a paid-social analyst for Maison Verdelle (lingerie/intimates). "
@@ -55,6 +61,20 @@ def analyze(
         messages=[{"role": "user", "content": content}],
     ) as stream:
         resp = stream.get_final_message()
+    # Fleet usage: report tokens right after the call that spent them. The
+    # server prices tokens (no client-side pricing table); this call never
+    # raises and never affects analyze()'s return, even on a bad response.
+    usage.spend(
+        action="rs-worker/analyze-competitor",
+        model=settings.model,
+        input_tokens=resp.usage.input_tokens,
+        output_tokens=resp.usage.output_tokens,
+        meta={
+            "brand": brand,
+            "distinct_ads": len(distinct_ads),
+            "scraped_count": scraped_count,
+        },
+    )
     import json
     text = "".join(b.text for b in resp.content if b.type == "text")
     return json.loads(text)
