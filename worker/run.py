@@ -22,6 +22,20 @@ def main(brand: str, domain: Optional[str] = None) -> None:
     # analysis runs on a scope-aware sample (active-first, recency+longevity).
     raw = ingest.dedup(ingest.pull_ads(platform_id))
     snap_id = store.save_snapshot(comp_id, platform_id, raw)
+
+    # Guard: a resolved page with no active ads (e.g. a brand page whose ads run
+    # under a replacement/"II" or persona identity) shouldn't burn an Anthropic call
+    # on an empty analysis. Record it observably and stop.
+    if not raw:
+        store.save_analysis(
+            comp_id, snap_id, {},
+            {"model": settings.model, "distinct_ads": 0, "images_analyzed": 0, "scraped_ads": 0},
+            status="no_ads",
+            error="Resolved page returned no active ads — try the exact ad-running page name.",
+        )
+        print(f"no ads for {brand}: resolved page has no active ads — try the exact ad-running page name", file=sys.stderr)
+        return
+
     sample = ingest.select_for_analysis(raw)
 
     meta = {
