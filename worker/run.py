@@ -13,6 +13,7 @@ from typing import Optional
 
 from worker import ingest, analyze, store
 from worker.config import settings
+from worker.spend_guard import ResearchSpendCapExceeded
 
 
 def main(brand: str, domain: Optional[str] = None) -> None:
@@ -54,6 +55,16 @@ def main(brand: str, domain: Optional[str] = None) -> None:
             f"saved analysis for {brand}: {len(sample)} of {len(raw)} ads analyzed, "
             f"{len(images)} images, {proposals} research proposals"
         )
+    except ResearchSpendCapExceeded as exc:
+        # A capped run is not a failed analysis -- do not write a spurious
+        # status="failed" row (the snapshot is already saved above). Report
+        # clearly and exit non-zero without calling Claude.
+        print(
+            f"spend cap hit ({exc.count}/{exc.limit} this {exc.window}) — not calling Claude "
+            f"for {brand}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except Exception as exc:  # noqa: BLE001 — always record an observable row (Codex P2-1)
         store.save_analysis(comp_id, snap_id, {}, meta, status="failed", error=str(exc))
         print(f"analysis FAILED for {brand} (snapshot saved): {exc}", file=sys.stderr)

@@ -1,4 +1,5 @@
 from anthropic import Anthropic
+from worker import spend_guard
 from worker.config import settings
 from worker.schema import ANALYSIS_SCHEMA
 
@@ -27,6 +28,11 @@ def analyze(
     scraped_count: int | None = None,
 ) -> dict:
     import base64
+    # Spend guard: one Anthropic call per analyze() call. Checked immediately
+    # before the API hit, so a capped call spends nothing. Raises
+    # ResearchSpendCapExceeded (a BaseException) which must NOT be caught
+    # here -- it propagates to worker.run.main's explicit handler.
+    spend_guard.guard()
     client = Anthropic(api_key=settings.anthropic_api_key)
     header = f"Competitor: {brand}\nAnalyzing {len(distinct_ads)} distinct creatives"
     if scraped_count is not None:
