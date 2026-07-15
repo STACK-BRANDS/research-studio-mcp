@@ -42,12 +42,37 @@ WINNING_CONCEPT_SCHEMA = {
     "required": ["concept", "live_variants", "longevity", "confidence", "signals"],
 }
 
+PROPOSED_RESEARCH_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "topic": {"type": "string"},              # what to research next, concretely
+        "rationale": {"type": "string"},           # one line: why it matters for MV
+        "kind": {
+            "type": "string",
+            "enum": [
+                "deeper_ad_pull",        # high-volume advertiser sampled thin → widen
+                "reach_deepdive",        # low-confidence winners → Apify EU-reach detail
+                "voc_reddit",            # painpoints/desires/objections unclear → Reddit VoC
+                "gap_analysis",          # ready to compare vs MV's own plays
+                "own_store",             # needs MV first-party data (ads/CX/performance)
+                "competitor_discovery",  # find more/adjacent competitors
+                "other",
+            ],
+        },
+    },
+    "required": ["topic", "rationale", "kind"],
+}
+
 ANALYSIS_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
         "playbook": PLAYBOOK_SCHEMA,
         "winning": {"type": "array", "items": WINNING_CONCEPT_SCHEMA},
+        # Research Studio proposing its own next steps — only when deeper research
+        # would materially improve the picture. Empty when the analysis is sufficient.
+        "proposed_research": {"type": "array", "items": PROPOSED_RESEARCH_SCHEMA},
     },
-    "required": ["playbook", "winning"],
+    "required": ["playbook", "winning", "proposed_research"],
 }

@@ -38,7 +38,15 @@ class Settings:
 
     @property
     def ad_limit(self) -> int:
-        return int(os.getenv("RESEARCH_AD_LIMIT", "25"))
+        # How many ads to PULL (cheap). Wide, so high-volume advertisers aren't a
+        # blind thin slice. The snapshot keeps all of these.
+        return int(os.getenv("RESEARCH_AD_LIMIT", "60"))
+
+    @property
+    def analysis_cap(self) -> int:
+        # How many distinct creatives the (expensive) Claude analysis sees, after a
+        # recency+longevity stratified sample of the pulled set.
+        return int(os.getenv("RESEARCH_ANALYSIS_CAP", "30"))
 
 
 settings = Settings()

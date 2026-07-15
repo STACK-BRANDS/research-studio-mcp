@@ -3,11 +3,14 @@
 Service-role only (the tables are RLS deny-all to `authenticated`). Uses the new
 sb_secret_ service key — legacy anon/service_role keys are disabled on this project.
 """
+import logging
 from typing import Optional
 
 from supabase import create_client, Client
 
 from worker.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _client() -> Client:
@@ -46,17 +49,32 @@ def save_analysis(
     error: Optional[str] = None,
 ) -> str:
     """Insert one analysis row. Always called — on failure, pass status='failed'
-    + error so the row is observable rather than an orphan snapshot (Codex P2-1)."""
+    + error so the row is observable rather than an orphan snapshot (Codex P2-1).
+
+    `proposed_research` is written when the column exists; if the migration adding
+    it hasn't been applied yet, the insert gracefully degrades (retry without it +
+    warn) so the worker never breaks on a not-yet-migrated databank.
+    """
     sb = _client()
-    row = sb.table("research_analyses").insert({
+    row = {
         "competitor_id": competitor_id,
         "snapshot_id": snapshot_id,
         "playbook": result.get("playbook", {}),
         "winning": result.get("winning", []),
+        "proposed_research": result.get("proposed_research", []),
         "model": meta.get("model", ""),
         "distinct_ads": meta.get("distinct_ads", 0),
         "images_analyzed": meta.get("images_analyzed", 0),
         "status": status,
         "error": error,
-    }).execute()
-    return row.data[0]["id"]
+    }
+    try:
+        res = sb.table("research_analyses").insert(row).execute()
+    except Exception as exc:  # noqa: BLE001
+        if "proposed_research" in str(exc).lower():
+            logger.warning("proposed_research column missing — run migration 025; storing without it")
+            row.pop("proposed_research", None)
+            res = sb.table("research_analyses").insert(row).execute()
+        else:
+            raise
+    return res.data[0]["id"]

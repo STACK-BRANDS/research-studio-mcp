@@ -18,16 +18,28 @@ from worker.config import settings
 def main(brand: str, domain: Optional[str] = None) -> None:
     comp_id = store.get_or_create_competitor(brand, domain)
     platform_id = ingest.resolve_platform_id(brand)
-    ads = ingest.dedup(ingest.pull_ads(platform_id))
-    snap_id = store.save_snapshot(comp_id, platform_id, ads)
+    # Pull wide + dedup; the SNAPSHOT keeps everything (spec §9). The expensive
+    # analysis runs on a scope-aware sample (active-first, recency+longevity).
+    raw = ingest.dedup(ingest.pull_ads(platform_id))
+    snap_id = store.save_snapshot(comp_id, platform_id, raw)
+    sample = ingest.select_for_analysis(raw)
 
-    meta = {"model": settings.model, "distinct_ads": len(ads), "images_analyzed": 0}
+    meta = {
+        "model": settings.model,
+        "distinct_ads": len(sample),
+        "images_analyzed": 0,
+        "scraped_ads": len(raw),
+    }
     try:
-        images = ingest.fetch_images(ads, cap=settings.max_images)
+        images = ingest.fetch_images(sample, cap=settings.max_images)
         meta["images_analyzed"] = len(images)
-        result = analyze.analyze(brand, ads, images)
+        result = analyze.analyze(brand, sample, images, scraped_count=len(raw))
         store.save_analysis(comp_id, snap_id, result, meta, status="ok")
-        print(f"saved analysis for {brand}: {len(ads)} ads, {len(images)} images")
+        proposals = len(result.get("proposed_research", []))
+        print(
+            f"saved analysis for {brand}: {len(sample)} of {len(raw)} ads analyzed, "
+            f"{len(images)} images, {proposals} research proposals"
+        )
     except Exception as exc:  # noqa: BLE001 — always record an observable row (Codex P2-1)
         store.save_analysis(comp_id, snap_id, {}, meta, status="failed", error=str(exc))
         print(f"analysis FAILED for {brand} (snapshot saved): {exc}", file=sys.stderr)

@@ -6,6 +6,7 @@ import ipaddress
 import logging
 import re
 import socket
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -87,6 +88,79 @@ def dedup(ads: list[dict]) -> list[dict]:
         seen.add(ad_id)
         out.append(ad)
     return out
+
+
+_START_FIELDS = ("start_date", "startDate", "ad_delivery_start_time", "start_time")
+_END_FIELDS = ("end_date", "endDate", "ad_delivery_stop_time", "end_time")
+
+
+def _parse_dt(v):
+    if v is None or v == "":
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        s = str(v).strip()
+        if s.isdigit():
+            return datetime.fromtimestamp(int(s), tz=timezone.utc)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _first(ad: dict, fields):
+    for f in fields:
+        if ad.get(f) not in (None, ""):
+            return ad.get(f)
+    return None
+
+
+def _days_active(ad: dict):
+    start = _parse_dt(_first(ad, _START_FIELDS))
+    if start is None:
+        return None
+    end = _parse_dt(_first(ad, _END_FIELDS)) or datetime.now(timezone.utc)
+    return max(0, (end - start).days)
+
+
+def _is_active(ad: dict) -> bool:
+    end = _parse_dt(_first(ad, _END_FIELDS))
+    if end is None:
+        return True  # no stop time known → treat as active (Ad Library default)
+    return end >= datetime.now(timezone.utc)
+
+
+def select_for_analysis(ads: list[dict], cap: int | None = None) -> list[dict]:
+    """Scope-aware sample for the expensive analysis: prefer active ads, then a
+    recency + longevity stratified sample (freshest N + longest-running N) capped
+    at `cap`. Date-aware when the ad objects carry parseable start/end dates;
+    falls back to input order (Ad Library returns newest-first) otherwise. The raw
+    snapshot keeps EVERYTHING — this only bounds what Claude analyzes.
+    """
+    cap = cap or settings.analysis_cap
+    active = [a for a in ads if _is_active(a)] or ads
+    if len(active) <= cap:
+        return active
+
+    dated = [(a, _days_active(a)) for a in active]
+    if sum(1 for _, d in dated if d is not None) >= cap:
+        # ascending days_active → smallest = newest, largest = longest-running
+        by_days = sorted(dated, key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0))
+        half = cap // 2
+        freshest = [a for a, _ in by_days[:half]]
+        longest = [a for a, _ in reversed(by_days)][: cap - half]
+        picked, seen = [], set()
+        for a in freshest + longest:
+            k = a.get("ad_id")
+            if k in seen:
+                continue
+            seen.add(k)
+            picked.append(a)
+        return picked[:cap]
+
+    # order-based fallback: front (fresh) + back (long-running)
+    half = cap // 2
+    return active[:half] + active[-(cap - half):]
 
 
 def _is_public_ip(ip_str: str) -> bool:
