@@ -4,6 +4,7 @@ ad_id, and fetch a capped set of creative images with an SSRF-safe downloader.
 
 import ipaddress
 import logging
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -18,21 +19,51 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 ALLOWED_SCHEMES = {"http", "https"}
 
 
+def _norm(s: str) -> str:
+    """Collapse to lowercase alphanumerics — so 'Sophie Olivia' matches
+    'Sophie & Olivia' and 'Secret Coco' matches 'SecretCoco.com'."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
 def resolve_platform_id(brand: str) -> str:
-    """Resolve a brand name to its Meta platform id via ScrapeCreators search,
-    picking the exact (case-insensitive) name match — never guesses among
-    fuzzy search results.
+    """Resolve a brand name to its Meta platform id via ScrapeCreators search.
+    Tries, in order: exact, case-insensitive exact, normalized-exact (ignoring
+    '&'/spaces/punctuation), then a unique normalized-prefix match. Raises with
+    the candidate list only when no confident match exists — never guesses among
+    genuinely ambiguous results. Pass the exact page name to force a specific one.
     """
     options = get_platform_id(brand)
     if not options:
         raise ValueError(f"No platform id found for brand '{brand}'")
+
+    # 1. exact / case-insensitive exact
     if brand in options:
         return options[brand]
     for name, page_id in options.items():
         if name.lower() == brand.lower():
             return page_id
+
+    nb = _norm(brand)
+
+    # 2. normalized-exact (e.g. "Sophie Olivia" -> "Sophie & Olivia").
+    #    If several, prefer the shortest name (the base page over "… Intimates"/"… II").
+    norm_exact = sorted(
+        [(name, pid) for name, pid in options.items() if _norm(name) == nb],
+        key=lambda x: len(x[0]),
+    )
+    if norm_exact:
+        logger.info("resolve_platform_id: normalized match '%s' for '%s'", norm_exact[0][0], brand)
+        return norm_exact[0][1]
+
+    # 3. unique normalized-prefix (e.g. "Secret Coco" -> "SecretCoco.com").
+    prefix = [(name, pid) for name, pid in options.items() if _norm(name).startswith(nb)]
+    if len(prefix) == 1:
+        logger.info("resolve_platform_id: unique prefix match '%s' for '%s'", prefix[0][0], brand)
+        return prefix[0][1]
+
     raise ValueError(
-        f"No exact name match for '{brand}' among search results: {list(options.keys())}"
+        f"No confident match for '{brand}'. Candidates: {list(options.keys())}. "
+        f"Re-run with the exact page name as the brand argument."
     )
 
 
