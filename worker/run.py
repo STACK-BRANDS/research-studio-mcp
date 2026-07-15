@@ -56,14 +56,23 @@ def main(brand: str, domain: Optional[str] = None) -> None:
             f"{len(images)} images, {proposals} research proposals"
         )
     except ResearchSpendCapExceeded as exc:
-        # A capped run is not a failed analysis -- do not write a spurious
+        # A blocked run is not a failed analysis -- do not write a spurious
         # status="failed" row (the snapshot is already saved above). Report
         # clearly and exit non-zero without calling Claude.
-        print(
-            f"spend cap hit ({exc.count}/{exc.limit} this {exc.window}) — not calling Claude "
-            f"for {brand}",
-            file=sys.stderr,
-        )
+        #
+        # `exc.window` is "hour"/"day" for a real cap hit (count/limit are
+        # meaningful) or "lock"/"persist" for a fail-closed guard-
+        # infrastructure failure (count/limit are placeholders); for the
+        # latter, str(exc) already carries the specific reason, so print it
+        # directly instead of the count/limit template.
+        if exc.window in ("hour", "day"):
+            print(
+                f"spend cap hit ({exc.count}/{exc.limit} this {exc.window}) — not calling Claude "
+                f"for {brand}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"{exc} — not calling Claude for {brand}", file=sys.stderr)
         sys.exit(1)
     except Exception as exc:  # noqa: BLE001 — always record an observable row (Codex P2-1)
         store.save_analysis(comp_id, snap_id, {}, meta, status="failed", error=str(exc))

@@ -1,8 +1,11 @@
 """Tests for the Anthropic spend guard (durable rolling-window call cap)."""
+import glob
 import json
+import os
 
 import pytest
 
+from worker import spend_guard
 from worker.spend_guard import ResearchSpendCapExceeded, guard, snapshot
 
 
@@ -137,3 +140,91 @@ def test_corrupt_state_file_treated_as_empty_no_crash(monkeypatch, state_file):
     with open(state_file) as f:
         data = json.load(f)
     assert data == [6_000_000.0]
+
+
+def test_write_failure_fails_closed(monkeypatch, state_file):
+    """P1-1: if the durable save fails, guard() must fail CLOSED (raise)
+    rather than allow the call. The old "still enforced in-process" comment
+    was false: a fresh `python -m worker.run` process reloads solely from
+    disk and makes exactly one guarded call, so a save failure that only
+    "enforces this run" via a discarded in-memory list enforces nothing --
+    the process goes on to spend anyway."""
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_HOUR", "1000")
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_DAY", "1000")
+
+    def _boom(path, calls):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(spend_guard, "_save", _boom)
+
+    with pytest.raises(ResearchSpendCapExceeded) as exc:
+        guard(now=7_000_000.0, state_path=state_file)
+
+    # Distinguishable from a real cap hit: window == "persist", and the
+    # message says why, not "N calls in the last persist".
+    assert exc.value.window == "persist"
+    assert "state persistence failed" in str(exc.value)
+
+    # The call must NOT have been allowed through -- nothing durable was
+    # recorded (no half-written/stale state file either).
+    assert not os.path.exists(state_file)
+
+
+def test_lock_failure_fails_closed(monkeypatch, state_file):
+    """P1-2: if the inter-process lock can't be acquired, guard() must fail
+    CLOSED rather than proceed unguarded -- proceeding without the lock is
+    exactly the race this fix closes (two processes both loading the
+    pre-write count and both passing)."""
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_HOUR", "1000")
+    monkeypatch.setenv("RESEARCH_ANALYSIS_MAX_PER_DAY", "1000")
+
+    def _boom(lock_path):
+        raise OSError("simulated lock contention/timeout")
+
+    monkeypatch.setattr(spend_guard, "_acquire_lock", _boom)
+
+    with pytest.raises(ResearchSpendCapExceeded) as exc:
+        guard(now=7_100_000.0, state_path=state_file)
+
+    assert exc.value.window == "lock"
+    assert "lock" in str(exc.value).lower()
+    assert not os.path.exists(state_file)
+
+
+def test_lock_is_released_after_normal_call(state_file):
+    """After a normal (non-contended) guard() call returns, the exclusive
+    lock must not be left held -- a leaked lock would wedge every later
+    process forever. Verified here by re-acquiring the same lock file
+    non-blocking right after; genuine cross-process contention on the lock
+    isn't practical to simulate deterministically in a single-process unit
+    test, so that path is covered by inspection instead: `_acquire_lock`
+    polls with a bounded timeout (never blocks forever) and `guard()`
+    releases it in a `finally`, so a partial failure mid-critical-section
+    still releases the lock for the next process."""
+    import fcntl
+
+    guard(now=7_200_000.0, state_path=state_file)
+
+    lock_path = f"{state_file}.lock"
+    assert os.path.exists(lock_path)
+
+    with open(lock_path, "a+") as fd:
+        # If guard() had leaked the exclusive lock, this would raise
+        # BlockingIOError (EAGAIN/EACCES) instead of succeeding.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def test_atomic_write_no_tmp_leftover(state_file):
+    """After a normal guard() call: the state file exists, holds valid JSON,
+    and no stray `<path>.tmp.*` file from the write-then-`os.replace` step is
+    left behind (a leaked temp file would mean the write wasn't cleanly
+    atomic)."""
+    guard(now=7_300_000.0, state_path=state_file)
+
+    assert os.path.exists(state_file)
+    with open(state_file) as f:
+        data = json.load(f)
+    assert data == [7_300_000.0]
+
+    assert glob.glob(f"{state_file}.tmp.*") == []
