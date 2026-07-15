@@ -1,0 +1,36 @@
+name: CI - Lint, Syntax Check, Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt --quiet
+      - name: Install ruff + pytest
+        run: pip install ruff pytest --quiet
+      - name: Run ruff lint
+        # Scoped to worker/ + the usage-gate script (this CI's own new
+        # surface): the rest of the repo (mcp_server.py, src/services/*) has
+        # pre-existing lint debt from before this repo had CI and is out of
+        # scope for the usage-reporter wave. Widen this once that debt is
+        # cleaned up separately.
+        run: ruff check worker check_usage_reporting.py --select E,W,F --ignore E501,W291,W293
+      - name: Syntax check
+        run: |
+          find . -name '*.py' -not -path './venv/*' -print0 \
+            | xargs -0 python -m py_compile
+          echo "Syntax OK"
+      - name: Fleet usage-reporting gate
+        run: python check_usage_reporting.py .
+      - name: Run tests
+        run: pytest -q

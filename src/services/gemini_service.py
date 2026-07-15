@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import logging
+# usage-exempt: analyze_ad_video MCP tool path, out of scope for the Wave 3 pilot (worker/analyze.py's Claude spend only) -- instrument in a later fleet-usage-standard wave
 from google import genai
-from google.genai import types
+from google.genai import types  # usage-exempt: analyze_ad_video path (see line above)
 from typing import Optional, List, Dict, Any
 
 # Set up logger
