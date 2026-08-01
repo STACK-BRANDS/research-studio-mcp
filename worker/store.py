@@ -122,8 +122,6 @@ def save_angle_observations(
     not in the registry, ...) is logged and swallowed, never raised. A
     missing table or failed insert must not fail the analysis save.
     """
-    if not per_ad:
-        return
     try:
         groups: dict[str, list] = {}
         for ad_row in per_ad:
@@ -134,7 +132,10 @@ def save_angle_observations(
 
         observations = []
         for angle_key, rows in groups.items():
-            longevities = [r["days_active"] for r in rows if isinstance(r.get("days_active"), int)]
+            longevities = [
+                r["days_active"] for r in rows
+                if isinstance(r.get("days_active"), int) and not isinstance(r.get("days_active"), bool)
+            ]
             top_longevity = max(longevities) if longevities else None
             example = rows[0]
             observations.append({
@@ -154,8 +155,13 @@ def save_angle_observations(
         sb = _client()
         # Idempotency: clear any pre-existing observations for this
         # analysis_id first (see docstring).
+        # Delete-then-insert runs even when there are no observations (empty
+        # per_ad): an empty re-save must still clear any stale rows, honouring
+        # the per-analysis_id idempotency contract (Terra P1). Insert only when
+        # there is something to write (an empty insert is a needless call).
         sb.table("research_angle_observations").delete().eq("analysis_id", analysis_id).execute()
-        sb.table("research_angle_observations").insert(observations).execute()
+        if observations:
+            sb.table("research_angle_observations").insert(observations).execute()
     except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
         logger.warning(
             "save_angle_observations: could not derive/save angle observations for analysis_id=%s (%s)",
