@@ -35,6 +35,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(store, "get_or_create_competitor", lambda brand, domain=None: "comp-1")
     monkeypatch.setattr(store, "start_run", lambda brand, comp_id=None: "run-1")
     monkeypatch.setattr(store, "finish_run", recorder)
+    monkeypatch.setattr(store, "get_pinned_platform_id", lambda comp_id: None)
+    monkeypatch.setattr(store, "record_page_identity", lambda *a, **k: None)
     monkeypatch.setattr(store, "save_snapshot", lambda comp_id, platform_id, ads: "snap-1")
     monkeypatch.setattr(store, "save_analysis", lambda *a, **k: "analysis-1")
     monkeypatch.setattr(run.ingest, "resolve_platform_id", lambda brand: "platform-1")
@@ -143,3 +145,52 @@ def test_no_ads_records_finish_run_once(monkeypatch, wired):
     assert call["est_claude_calls"] == 0
     assert call["scraped_ads"] == 0
     assert call["analyzed"] == 0
+
+
+def test_pinned_platform_id_skips_fuzzy_resolve(monkeypatch, wired):
+    """A pinned/observed platform_id in research_page_identities is
+    authoritative: when one exists, ingest.resolve_platform_id (the fuzzy
+    search that mis-resolved 'Lounge' to an unrelated Chilean retailer) must
+    not be called at all, and the pinned id is what gets used downstream."""
+    monkeypatch.setattr(store, "get_pinned_platform_id", lambda comp_id: "pinned-platform-1")
+    monkeypatch.setattr(
+        run.ingest, "resolve_platform_id",
+        lambda brand: pytest.fail("resolve_platform_id must not be called when a pin exists"),
+    )
+    seen_platform_ids = []
+    monkeypatch.setattr(
+        run.ingest, "pull_ads",
+        lambda platform_id: seen_platform_ids.append(platform_id) or [{"id": "1"}],
+    )
+    monkeypatch.setattr(run.ingest, "fetch_images", lambda sample, cap=None: [])
+    monkeypatch.setattr(
+        run.analyze, "analyze",
+        lambda *a, **k: {"playbook": {}, "winning": [], "proposed_research": []},
+    )
+
+    run.main("Lounge")
+
+    assert seen_platform_ids == ["pinned-platform-1"]
+    assert wired.calls[0]["status"] == "done"
+
+
+def test_fuzzy_resolve_records_observed_identity(monkeypatch, wired):
+    """When nothing is pinned yet, the existing fuzzy resolve_platform_id path
+    runs unchanged, and its result is captured into research_page_identities
+    as kind='observed' so the NEXT run for this brand is pinned."""
+    monkeypatch.setattr(store, "get_pinned_platform_id", lambda comp_id: None)
+    monkeypatch.setattr(run.ingest, "resolve_platform_id", lambda brand: "fuzzy-platform-1")
+    recorded = []
+    monkeypatch.setattr(store, "record_page_identity", lambda *a, **k: recorded.append((a, k)))
+    monkeypatch.setattr(run.ingest, "fetch_images", lambda sample, cap=None: [])
+    monkeypatch.setattr(
+        run.analyze, "analyze",
+        lambda *a, **k: {"playbook": {}, "winning": [], "proposed_research": []},
+    )
+
+    run.main("Lounge")
+
+    assert len(recorded) == 1
+    args, kwargs = recorded[0]
+    assert args == ("comp-1", "fuzzy-platform-1", None, "observed")
+    assert kwargs == {}

@@ -29,6 +29,93 @@ def get_or_create_competitor(name: str, domain: Optional[str] = None) -> str:
     return created.data[0]["id"]
 
 
+def get_pinned_platform_id(competitor_id: str) -> Optional[str]:
+    """Return a previously-recorded platform_id for this competitor from
+    `research_page_identities`, if one exists -- so the worker can skip the
+    error-prone fuzzy search entirely once a page has been pinned or observed
+    before. Prefers a row with `kind='primary'` (an explicit operator pin);
+    falls back to the most-recently-seen row of any kind (e.g. an earlier
+    'observed' resolution) when no primary exists. Returns None if this
+    competitor has no recorded identity yet.
+
+    Best-effort, same contract as start_run/finish_run: this is a READ used to
+    short-circuit resolve_platform_id, not the analysis itself -- ANY failure
+    here (table not yet migrated, network blip, ...) must never break or block
+    the worker. On failure, log a warning and return None so the caller falls
+    back to the existing fuzzy-resolve path.
+    """
+    try:
+        sb = _client()
+        res = (
+            sb.table("research_page_identities")
+            .select("platform_id, kind, first_seen")
+            .eq("competitor_id", competitor_id)
+            .order("first_seen", desc=True)
+            .execute()
+        )
+        rows = res.data or []
+        for row in rows:
+            if row.get("kind") == "primary":
+                return row["platform_id"]
+        return rows[0]["platform_id"] if rows else None
+    except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
+        logger.warning(
+            "get_pinned_platform_id: could not read pinned identity for competitor_id=%s (%s)",
+            competitor_id, exc,
+        )
+        return None
+
+
+def record_page_identity(
+    competitor_id: str,
+    platform_id: str,
+    page_name: Optional[str] = None,
+    kind: str = "observed",
+) -> None:
+    """Record a competitor -> Meta platform_id resolution into
+    `research_page_identities`, so a fuzzy resolution is captured for future
+    runs (pin-first: get_pinned_platform_id will find it next time) and for
+    later operator review/curation.
+
+    Dedup: skips the insert if a row with this exact (competitor_id,
+    platform_id) pair already exists, so re-running the same brand doesn't
+    pile up duplicate rows every run.
+
+    `kind='observed'` (the default) marks a fuzzy-resolved id -- this function
+    never auto-promotes a resolution to `kind='primary'`; that stays an
+    explicit, separate curation action. Pass kind='primary' only when the
+    caller is deliberately pinning an id.
+
+    Best-effort, same contract as start_run/finish_run: this is capture/
+    observability, not the analysis itself -- ANY failure here (table not yet
+    migrated, network blip, duplicate race, ...) must never break or block the
+    worker.
+    """
+    try:
+        sb = _client()
+        existing = (
+            sb.table("research_page_identities")
+            .select("id")
+            .eq("competitor_id", competitor_id)
+            .eq("platform_id", platform_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return
+        sb.table("research_page_identities").insert({
+            "competitor_id": competitor_id,
+            "platform_id": platform_id,
+            "page_name": page_name,
+            "kind": kind,
+        }).execute()
+    except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
+        logger.warning(
+            "record_page_identity: could not record identity for competitor_id=%s platform_id=%s (%s)",
+            competitor_id, platform_id, exc,
+        )
+
+
 def save_snapshot(competitor_id: str, platform_id: str, ads: list) -> str:
     """Insert one timestamped ad snapshot (never overwritten). Returns its id."""
     sb = _client()

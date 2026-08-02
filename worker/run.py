@@ -7,6 +7,7 @@ Scrapes a competitor's live Meta ads, analyzes them server-side with Claude
 Requires the server-side env (see .env.example): ANTHROPIC_API_KEY,
 SCRAPECREATORS_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY.
 """
+import logging
 import sys
 import traceback
 from typing import Optional
@@ -14,6 +15,8 @@ from typing import Optional
 from worker import ingest, analyze, store
 from worker.config import settings
 from worker.spend_guard import ResearchSpendCapExceeded
+
+logger = logging.getLogger(__name__)
 
 
 def main(brand: str, domain: Optional[str] = None) -> None:
@@ -42,7 +45,19 @@ def main(brand: str, domain: Optional[str] = None) -> None:
     meta = {"model": settings.model, "distinct_ads": 0, "images_analyzed": 0, "scraped_ads": 0}
 
     try:
-        platform_id = ingest.resolve_platform_id(brand)
+        # Pin-first: a previously pinned/observed platform_id in
+        # research_page_identities is authoritative and skips the fuzzy
+        # search entirely (the fuzzy match is what mis-resolved "Lounge" to
+        # an unrelated Chilean retailer and left "Secret Coco"/"Hunkemoller"
+        # on empty pages). Fuzzy fallback only when nothing is pinned yet,
+        # and every fuzzy resolution is captured so the next run for this
+        # brand is pinned automatically.
+        platform_id = store.get_pinned_platform_id(comp_id)
+        if platform_id:
+            logger.info("using pinned platform_id '%s' for '%s'", platform_id, brand)
+        else:
+            platform_id = ingest.resolve_platform_id(brand)
+            store.record_page_identity(comp_id, platform_id, None, "observed")
         # Pull wide + dedup; the SNAPSHOT keeps everything (spec §9). The expensive
         # analysis runs on a scope-aware sample (active-first, recency+longevity).
         raw = ingest.dedup(ingest.pull_ads(platform_id))
