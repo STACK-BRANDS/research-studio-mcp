@@ -13,6 +13,13 @@ from worker.config import settings
 
 logger = logging.getLogger(__name__)
 
+# The single Supabase Storage bucket every site-capture connector writes to
+# (Phase 2, migrations 142-144). A literal constant, like every table name
+# elsewhere in this module -- not a `settings` tunable, since the deployed
+# `rs_create_site_capture` contract already fixes `captured_html_path` to a
+# `captures/<sha>.*` layout within this specific bucket.
+RESEARCH_MEDIA_BUCKET = "research-media"
+
 
 def _client() -> Client:
     return create_client(settings.supabase_url, settings.supabase_service_key)
@@ -684,3 +691,188 @@ def find_job_by_idem(idempotency_key: str) -> Optional[dict]:
     except Exception as exc:  # noqa: BLE001 — best-effort read only
         logger.warning("find_job_by_idem: could not read job for %s (%s)", idempotency_key, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Site captures (research_site_captures / research_collection_runs) -- Phase 2
+# of the deep-research plan, migrations 142-144. `create_site_capture` and
+# `capture_exists` are NOT best-effort (job-spine banner above applies: a
+# caller depends on an honest result to decide whether to skip a mint or
+# re-attempt one — silently swallowing a failure here could either mint a
+# duplicate capture or silently drop a real one). `upload_capture_object` is
+# also not best-effort in the sense that it never swallows a REAL storage
+# failure, but a "the object already exists" response is expected, normal
+# no-clobber behavior, not an error. `start_collection_run`/
+# `finish_collection_run` are observability, same best-effort contract as
+# `start_run`/`finish_run` above.
+# ---------------------------------------------------------------------------
+
+def create_site_capture(
+    url: str,
+    source_url: str,
+    raw_content: str,
+    connector: str,
+    competitor_id: Optional[str] = None,
+    confidence: Optional[str] = None,
+    captured_html_path: Optional[str] = None,
+) -> str:
+    """Call the deployed `rs_create_site_capture` RPC (migrations 142-144):
+    mints one `research_site_captures` row and returns its id.
+
+    `p_captured_html_path` is REQUIRED by the RPC itself (it raises if
+    null/blank) — the fetched bytes must already be durably stored
+    (`upload_capture_object`, storage-first) BEFORE this is ever called; see
+    `worker.connectors.web_fetch.capture_pages` for the ordering this
+    wrapper depends on its caller following. `content_sha256` is computed
+    SERVER-SIDE from `p_raw_content` — this wrapper never computes or sends
+    a hash itself. The RPC also forces `verification_status`/`origin` to
+    unverified/collected and REFUSES any connector not `status='enabled'` in
+    `research_connectors` — `web.fetch` is seeded `status='proposed'` today,
+    so a real call raises "not an enabled connector" until a human enables
+    it; that is the deployed contract's own behavior, not a bug in this
+    wrapper (Phase 2 ships the code; enabling the connector is a separate,
+    later, human action).
+
+    NOT best-effort (see the job-spine banner above this section): any RPC
+    failure (missing captured_html_path, connector not enabled, DB error)
+    propagates unchanged — a caller that silently swallowed this could
+    believe a capture was minted when it was not.
+
+    Optional params (`competitor_id`/`confidence`/`captured_html_path`) are
+    omitted from the RPC payload entirely when None, matching every other
+    RPC wrapper's convention in this module (`rs_reserve_spend`,
+    `rs_settle_call`).
+    """
+    sb = _client()
+    params: dict = {
+        "p_url": url,
+        "p_source_url": source_url,
+        "p_raw_content": raw_content,
+        "p_connector": connector,
+    }
+    if competitor_id is not None:
+        params["p_competitor_id"] = competitor_id
+    if confidence is not None:
+        params["p_confidence"] = confidence
+    if captured_html_path is not None:
+        params["p_captured_html_path"] = captured_html_path
+    res = sb.rpc("rs_create_site_capture", params).execute()
+    return res.data
+
+
+def capture_exists(content_sha256: str, source_url: str) -> bool:
+    """True iff a `research_site_captures` row already exists with this
+    exact (content_sha256, source_url) pair — the web.fetch connector's
+    idempotent-skip check: identical content already recorded for this
+    source_url means the correct action is to skip minting and record
+    'unchanged', not re-mint a duplicate row.
+
+    NOT best-effort: a caller that treated a failed read here as "does not
+    exist" could re-mint a duplicate capture row for content already on
+    record, so any failure other than a clean "0 rows" propagates
+    unchanged.
+    """
+    sb = _client()
+    res = (
+        sb.table("research_site_captures")
+        .select("id")
+        .eq("content_sha256", content_sha256)
+        .eq("source_url", source_url)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+
+def _is_duplicate_object_error(exc: Exception) -> bool:
+    """Best-effort classification of a Supabase Storage `StorageApiError` as
+    "the object already existed" (expected, no-clobber — return False, do
+    not raise) vs. any OTHER storage failure (auth, missing bucket, network
+    — must propagate, never be mistaken for a harmless duplicate). Checked
+    by `.code`/`.status` first (the structured fields `storage3.exceptions.
+    StorageApiError` actually carries) and falls back to a message substring
+    only if those are absent, since the exact wire shape of a duplicate-
+    object error is not something this repo can verify against a live
+    Supabase Storage instance in CI.
+    """
+    code = str(getattr(exc, "code", "") or "").lower()
+    status = str(getattr(exc, "status", "") or "")
+    message = str(getattr(exc, "message", "") or exc).lower()
+    return (
+        "duplicate" in code
+        or "already exists" in message
+        or (status in ("409", "400") and "exist" in message)
+    )
+
+
+def upload_capture_object(path: str, data: bytes, content_type: str) -> bool:
+    """Upload `data` to the `RESEARCH_MEDIA_BUCKET` ("research-media") at
+    `path`. NO-CLOBBER: a plain create-only upload (never `upsert`), so an
+    object that already exists at `path` is left untouched.
+
+    Returns True iff this call's own upload actually wrote a fresh object;
+    False if it already existed — expected and harmless (two different
+    pages, or two different runs, can share one `content_sha256`/path, and
+    the object's content is already correct since its path IS its hash, so
+    re-uploading would be wasted work, never a correctness requirement).
+
+    Any OTHER storage failure (auth, missing bucket, network) is NOT
+    swallowed — it propagates unchanged, so a caller never mistakes "the
+    upload silently failed for an unrelated reason" for "the object already
+    existed".
+    """
+    from storage3.exceptions import StorageApiError
+
+    sb = _client()
+    try:
+        sb.storage.from_(RESEARCH_MEDIA_BUCKET).upload(
+            path, data, file_options={"content-type": content_type},
+        )
+        return True
+    except StorageApiError as exc:
+        if _is_duplicate_object_error(exc):
+            return False
+        raise
+
+
+def start_collection_run(connector: str) -> Optional[str]:
+    """Record that a connector's collection run has STARTED
+    (`research_collection_runs`), mirroring `start_run`/`finish_run`'s
+    existing `research_runs` pattern for the ads path — observability for a
+    whole page-plan pass, not any single page.
+
+    Best-effort, same contract as `start_run`: any failure (table not yet
+    migrated, network blip) must never break or block the worker — log a
+    warning and return None. Callers must treat a None run_id as "registry
+    unavailable" and no-op the corresponding `finish_collection_run`.
+    """
+    try:
+        sb = _client()
+        row = sb.table("research_collection_runs").insert({
+            "connector": connector,
+            "status": "running",
+        }).execute()
+        return row.data[0]["id"]
+    except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
+        logger.warning("start_collection_run: could not record run start for connector=%s (%s)", connector, exc)
+        return None
+
+
+def finish_collection_run(run_id: Optional[str], status: str, records: Optional[int] = None) -> None:
+    """Record that a connector's collection run FINISHED. No-op if `run_id`
+    is None (start_collection_run already failed/degraded for this run).
+    Best-effort, same contract as `finish_run`: any failure here must never
+    raise."""
+    if run_id is None:
+        return
+    try:
+        sb = _client()
+        sb.table("research_collection_runs").update({
+            "status": status,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "records": records,
+        }).eq("id", run_id).execute()
+    except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
+        logger.warning(
+            "finish_collection_run: could not record run finish for run_id=%s (%s)", run_id, exc,
+        )

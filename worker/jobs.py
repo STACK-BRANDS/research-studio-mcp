@@ -28,6 +28,10 @@ queue consumer (Phase 1, tasks 1.1-1.3 of the deep-research plan):
       existing single-shot ads orchestration UNCHANGED. It is dispatched
       from here (`_dispatch`), not implemented here.
 
+  Phase 2 adds a second `_dispatch` branch, (scrape, web.fetch) ->
+  `worker.connectors.web_fetch.capture_pages` -- the static-HTML
+  site-capture connector. Also dispatched from here, not implemented here.
+
   1.7 `enqueue()` (a thin wrapper over `store.enqueue_job`) and `drain()` --
       the consumer poll loop: reap -> claim (a FRESH fencing token per
       claim, never reused across iterations) -> mark_running -> heartbeat ->
@@ -333,31 +337,44 @@ def _spawn_heartbeat(job_id: str, claimant: str, job_kind: Optional[str]) -> _He
 
 def _dispatch(job: dict, claimant: str) -> tuple:
     """Route one claimed+running job to its handler by (job_kind,
-    connector). Only one real handler exists in Phase 1: (scrape,
+    connector). Two real handlers exist as of Phase 2: (scrape,
     ad_library.scrapecreators) -> `worker.run.handle_scrape` (Task 1.6, the
-    ads-as-scrape reuse). Every other (job_kind, connector) combination --
-    collect/verify/synthesize, and any scrape connector besides the ads one
-    -- has no handler yet (Tasks P2-P4): it is finished 'failed' with a
+    ads-as-scrape reuse) and (scrape, web.fetch) ->
+    `worker.connectors.web_fetch.capture_pages` (Phase 2, the static-HTML
+    site-capture connector). Every other (job_kind, connector) combination --
+    collect/verify/synthesize, and any scrape connector besides these two --
+    has no handler yet (Tasks P3-P4): it is finished 'failed' with a
     clear, machine-greppable error rather than raising or crashing the
     loop, so an as-yet-unimplemented job_kind can already be queued (e.g. by
     a future planner) without taking down a worker that doesn't know how to
     run it yet.
 
     Returns `(status, cost_cents, error)` -- `_run_claimed()` passes these
-    straight through to `finish_job`. The scrape branch's `error` is
+    straight through to `finish_job`. The scrape/ads branch's `error` is
     `handle_scrape`'s own (P2-2 fix: no longer discarded to None on a
-    failure) -- passed through here unchanged, not re-derived.
+    failure) -- passed through here unchanged, not re-derived. The
+    scrape/web.fetch branch's `cost_cents` is always `0` (not None, and not
+    priced via `settings.price_for`) -- unlike the ads path, this
+    connector's true cost is KNOWN, exactly, client-side: it makes no paid
+    API call at all (`settings.price_cards["scrape"]["web.fetch"]` prices it
+    at 0 cents for exactly this reason), so 0 is the honest actual cost, not
+    an estimate. This is also why this branch never calls
+    `worker.budget.reserve()`/`settle()`: those guard a PAID call's
+    worst-case ceiling against a project's ledger, and there is no such call
+    here to guard.
 
-    `worker.run` is imported HERE, inside the function, rather than at
-    module level, specifically to avoid a circular import: `worker.run`
-    imports `worker.jobs` at module level (for `enqueue`/`drain`/
-    `make_claimant` in its CLI `main()`), and this module dispatches back
-    into `worker.run.handle_scrape` -- a module-level `from worker import
-    run` on THIS side as well would make the two modules' load order matter
-    (whichever is imported first would see the other only partially
-    initialized). Deferring the import to call time sidesteps the ordering
-    question entirely: by the time `drain()` actually dispatches a job, both
-    modules have long finished importing.
+    `worker.run` and `worker.connectors.web_fetch` are both imported HERE,
+    inside the function, rather than at module level, specifically to avoid
+    a circular import: `worker.run` imports `worker.jobs` at module level
+    (for `enqueue`/`drain`/`make_claimant` in its CLI `main()`), and
+    `worker.connectors.web_fetch` imports `worker.jobs` at module level too
+    (for `jobs.assert_lease`'s per-page lease fence) -- this module
+    dispatches back into both, so a module-level import on THIS side as
+    well would make load order matter (whichever is imported first would
+    see the other only partially initialized). Deferring both imports to
+    call time sidesteps the ordering question entirely: by the time
+    `drain()` actually dispatches a job, every module has long finished
+    importing.
     """
     job_kind = job.get("job_kind")
     params = job.get("params") or {}
@@ -367,6 +384,31 @@ def _dispatch(job: dict, claimant: str) -> tuple:
         from worker import run  # noqa: PLC0415 -- deferred; see docstring above.
         status, cost_cents, error = run.handle_scrape(job, claimant)
         return status, cost_cents, error
+
+    if job_kind == "scrape" and connector == "web.fetch":
+        from worker.connectors import web_fetch  # noqa: PLC0415 -- deferred; see docstring above.
+        plan = params.get("plan") or [] if isinstance(params, dict) else []
+        capture_result = web_fetch.capture_pages(job, claimant, plan)
+
+        error = None
+        if capture_result["errors"]:
+            sample = "; ".join(
+                f"{e.get('url')}: {e.get('reason')}" for e in capture_result["errors"][:5]
+            )
+            error = (
+                f"{len(capture_result['errors'])} of {len(plan)} page(s) did not capture "
+                f"(captured={capture_result['captured']} unchanged={capture_result['unchanged']} "
+                f"robots_skipped={capture_result['robots_skipped']}): {sample}"
+            )
+        # A page-plan run is 'failed' only when NOTHING useful came of it --
+        # every page either errored or was skipped, and none was captured or
+        # found unchanged. A run with SOME real errors alongside real
+        # progress is still 'done' (partial progress is success, not
+        # failure); the error summary above is preserved either way so it is
+        # never silently lost.
+        total_ok = capture_result["captured"] + capture_result["unchanged"]
+        status = "failed" if (plan and total_ok == 0 and capture_result["errors"]) else "done"
+        return status, 0, error
 
     return "failed", None, "handler not implemented (P2-P4)"
 

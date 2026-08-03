@@ -83,6 +83,51 @@ class Settings:
         }
 
     @property
+    def extractor_version(self) -> str:
+        """`worker.canonical.EXTRACTOR_VERSION`, re-exported here so a
+        caller building a `collect` job's idempotency key
+        (`worker.jobs.idem_collect`, which takes an `extractor_version`
+        argument) can read it via `settings` like every other tunable,
+        without importing `worker.canonical` directly. Deferred import (not
+        module-level) purely to avoid giving `worker.config` -- imported by
+        nearly everything else in this package -- an import-time dependency
+        on `worker.canonical`; `worker.canonical` itself never imports
+        `worker.config`, so there is no real circularity, only an
+        avoidable one."""
+        from worker.canonical import EXTRACTOR_VERSION
+        return EXTRACTOR_VERSION
+
+    @property
+    def web_fetch_cap_bytes(self) -> int:
+        """Byte cap for one web.fetch page fetch
+        (`worker.net.safe_fetch_text`'s `cap_bytes`), overridable via
+        `RESEARCH_WEB_FETCH_CAP_BYTES`. Defaults to 2MiB -- generous for a
+        single static HTML page's rendered markup, small enough that one
+        pathological page can't blow up the connector's memory or the
+        research-media upload."""
+        return int(os.getenv("RESEARCH_WEB_FETCH_CAP_BYTES", str(2 * 1024 * 1024)))
+
+    @property
+    def web_fetch_default_rate_limits(self) -> dict:
+        """Fallback `rate_limits` for the web.fetch connector
+        (`worker.connectors.web_fetch.capture_pages`) when a job's `params`
+        doesn't carry its own (e.g. an ad-hoc/manually-enqueued job built
+        before a planner always attaches the connector's live
+        `research_connectors.rate_limits` row). Mirrors web.fetch's DEPLOYED
+        seed value (`{"min_interval_seconds": 3,
+        "max_pages_per_domain_per_run": 40}`) -- this is a defensive
+        fallback, not the authoritative source; `research_connectors` in the
+        database is. Individually overridable via
+        `RESEARCH_WEB_FETCH_MIN_INTERVAL_SECONDS` /
+        `RESEARCH_WEB_FETCH_MAX_PAGES_PER_DOMAIN`."""
+        return {
+            "min_interval_seconds": int(os.getenv("RESEARCH_WEB_FETCH_MIN_INTERVAL_SECONDS", "3")),
+            "max_pages_per_domain_per_run": int(
+                os.getenv("RESEARCH_WEB_FETCH_MAX_PAGES_PER_DOMAIN", "40")
+            ),
+        }
+
+    @property
     def price_cards(self) -> dict:
         """Worst-case (never average) cents per (job_kind, connector) -- the
         ceiling `worker.budget.reserve()` prices a paid call at and hands to
