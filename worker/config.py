@@ -219,3 +219,38 @@ class Settings:
 
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# Per-model USD-per-million-token rates (input, output) -- used ONLY to convert a paid
+# call's REAL token usage into an actual-cost cents figure (`worker.extract._actual_cents`
+# and its worst-case-reservation guard), never to price a RESERVATION (that stays
+# `price_for()`'s worst-case ceiling above). Keyed by `settings.model`'s value so a
+# differently-configured model settles its OWN true cost rather than a hardcoded Sonnet
+# rate -- pricing every model's actual spend at Sonnet's rate would silently misstate the
+# ledger for any other configured model, in either direction.
+#
+# Documented, not measured against a live invoice -- re-derive from the provider's current
+# rate card if it changes. Standard (non-introductory) rates, deliberately, so this table
+# stays valid after any temporary intro-pricing window closes.
+# ---------------------------------------------------------------------------
+MODEL_RATES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-opus-5": (15.0, 75.0),
+    "claude-haiku-4-5": (0.8, 4.0),
+}
+
+
+def model_rate_usd_per_mtok(model: str) -> tuple[float, float]:
+    """(input_usd_per_mtok, output_usd_per_mtok) for `model`.
+
+    Raises `KeyError` for a model not in `MODEL_RATES_USD_PER_MTOK` -- fail closed rather
+    than silently falling back to some other model's rate, which would let a paid call's
+    true cost be mis-recorded (over or under) without anyone noticing. The caller
+    (`worker.extract`) treats this the same as a card that under-reserves: settle a
+    release and raise loudly rather than proceed on a guessed rate.
+    """
+    try:
+        return MODEL_RATES_USD_PER_MTOK[model]
+    except KeyError:
+        raise KeyError(f"no USD/MTok rate configured for model={model!r}") from None

@@ -876,3 +876,189 @@ def finish_collection_run(run_id: Optional[str], status: str, records: Optional[
         logger.warning(
             "finish_collection_run: could not record run finish for run_id=%s (%s)", run_id, exc,
         )
+
+
+# ---------------------------------------------------------------------------
+# P3 EXTRACTION (the `collect` job) -- read a site capture back, download its stored
+# objects, and mint VoC quotes / site-fact findings via the deployed evidence-integrity
+# RPCs (migrations 142/146). NONE of these are best-effort (same job-spine banner as the
+# site-capture section above): `run_collect` depends on an honest read/mint result to
+# decide whether to drop or count a piece of extracted content -- silently swallowing a
+# failure here could either mint fabricated evidence as if it succeeded, or hide a real
+# infrastructure failure behind a false "row not found".
+# ---------------------------------------------------------------------------
+
+def get_site_capture(capture_id: str) -> Optional[dict]:
+    """Read one `research_site_captures` row by id: `source_url`, `url`, `competitor_id`,
+    `content_sha256`, `captured_html_path`, `connector` -- everything `run_collect` needs
+    to locate this capture's stored objects and mint evidence citing the right source.
+
+    Returns None if no row matches this id. NOT best-effort: a missing capture row is a
+    real precondition failure for the collect job (there is nothing to extract), so the
+    caller must be able to tell "not found" apart from "read failed" -- any failure other
+    than a clean "0 rows" (network, auth, DB error) propagates unchanged rather than
+    collapsing to the same None a genuine miss returns.
+    """
+    sb = _client()
+    res = (
+        sb.table("research_site_captures")
+        .select("id, competitor_id, url, source_url, captured_html_path, content_sha256, connector")
+        .eq("id", capture_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return None
+    return res.data[0]
+
+
+def collect_done_exists(capture_id: str, extractor_version: str) -> bool:
+    """True iff a `collect` job for this exact (capture_id, extractor_version) already reached
+    status='done' -- the collect-idempotency marker `run_collect` checks before doing any work, so a
+    capture that already completed is never re-extracted (even across a retry with a fresh
+    reservation ref). A FAILED collect leaves no 'done' row, so this correctly returns False and the
+    retry re-extracts.
+
+    NOT best-effort: a read failure must NOT be guessed as 'not done' (which would re-extract and
+    risk duplicate evidence); anything other than a clean query result propagates, failing the job
+    so it retries rather than double-minting.
+    """
+    sb = _client()
+    res = (
+        sb.table("research_jobs")
+        .select("id")
+        .eq("job_kind", "collect")
+        .eq("status", "done")
+        .eq("params->>capture_id", capture_id)
+        .eq("params->>extractor_version", extractor_version)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+
+def download_capture_object(path: str) -> bytes:
+    """Download the raw bytes stored at `path` (e.g. `captures/<sha>.txt` or
+    `captures/<sha>.html`) in `RESEARCH_MEDIA_BUCKET`. The read-side counterpart of
+    `upload_capture_object`.
+
+    NOT best-effort: any failure (object missing, auth, network) propagates unchanged --
+    `run_collect` has no reasonable fallback for a capture's stored object being
+    unreadable, and must fail the job rather than silently extracting from nothing.
+    """
+    sb = _client()
+    return sb.storage.from_(RESEARCH_MEDIA_BUCKET).download(path)
+
+
+def create_voc_quote(
+    quote: str,
+    source_url: str,
+    raw_content: str,
+    connector: str,
+    competitor_id: Optional[str] = None,
+    store_id: Optional[str] = None,
+    quote_type: Optional[str] = None,
+    theme: Optional[str] = None,
+    product_area: Optional[str] = None,
+    confidence: Optional[str] = None,
+    source_start: Optional[int] = None,
+    source_end: Optional[int] = None,
+) -> str:
+    """Call the deployed `rs_create_voc_quote` RPC (migration 142, the 12-arg overload
+    with the A-1 verbatim check + source-span params): mints one `research_voc_quotes`
+    row and returns its id.
+
+    `p_raw_content` is the evidence the RPC's own A-1 verbatim check runs against — the
+    quote must be a NORMALIZED substring of exactly this text (or, when a source span is
+    given, the canonical text at `[source_start, source_end)` must normalize to the
+    quote). For a customer-voice quote, the caller (`worker.extract.run_collect`) MUST
+    pass the extracted REVIEW text here, never the whole-page canonical text — that is
+    what makes "customer voice" structurally enforced rather than a model's say-so.
+
+    `content_sha256` is computed server-side from `p_raw_content` — this wrapper never
+    computes or sends a hash itself, matching `create_site_capture`'s convention.
+
+    NOT best-effort (see the job-spine banner above): any RPC failure — a quote that
+    fails the A-1 verbatim/span check, an unregistered/non-enabled connector, a DB error
+    — propagates unchanged. `run_collect`'s admission control is the one place that
+    catches this and counts it as a drop; this wrapper itself must never swallow it,
+    or a caller could mistake a rejected mint for a successful one.
+
+    Optional params are omitted from the RPC payload entirely when None, matching every
+    other RPC wrapper's convention in this module.
+    """
+    sb = _client()
+    params: dict = {
+        "p_quote": quote,
+        "p_source_url": source_url,
+        "p_raw_content": raw_content,
+        "p_connector": connector,
+    }
+    if competitor_id is not None:
+        params["p_competitor_id"] = competitor_id
+    if store_id is not None:
+        params["p_store_id"] = store_id
+    if quote_type is not None:
+        params["p_type"] = quote_type
+    if theme is not None:
+        params["p_theme"] = theme
+    if product_area is not None:
+        params["p_product_area"] = product_area
+    if confidence is not None:
+        params["p_confidence"] = confidence
+    if source_start is not None:
+        params["p_source_start"] = source_start
+    if source_end is not None:
+        params["p_source_end"] = source_end
+    res = sb.rpc("rs_create_voc_quote", params).execute()
+    return res.data
+
+
+def create_finding(
+    finding_kind: str,
+    schema_version: int,
+    payload: dict,
+    source_url: str,
+    raw_content: str,
+    connector: str,
+    project_id: Optional[str] = None,
+    store_id: Optional[str] = None,
+    confidence: Optional[str] = None,
+) -> str:
+    """Call the deployed `rs_create_finding` RPC (migration 033, registry-gated by
+    migration 146's `('site_fact', 1)` seed): mints one `research_findings` row and
+    returns its id.
+
+    Refuses any `(finding_kind, schema_version)` not already present in
+    `research_finding_kinds` (defense in depth ahead of the table's own FK) and any
+    non-enabled connector — same legal-gate discipline as `create_voc_quote`/
+    `create_site_capture`. `content_sha256` is computed server-side from `p_raw_content`.
+
+    For a `site_fact` finding, the caller (`worker.extract.run_collect`) passes the
+    page's own CANONICAL text as `raw_content` — a finding is a page fact, not customer
+    voice, so it is evidenced against the whole page, not the review-widget text.
+
+    NOT best-effort: any RPC failure (unregistered kind/version, non-enabled connector,
+    DB error) propagates unchanged; `run_collect`'s admission control is the one place
+    that catches this and counts it as a drop.
+
+    Optional params are omitted from the RPC payload entirely when None, matching every
+    other RPC wrapper's convention in this module.
+    """
+    sb = _client()
+    params: dict = {
+        "p_finding_kind": finding_kind,
+        "p_schema_version": schema_version,
+        "p_payload": payload,
+        "p_source_url": source_url,
+        "p_raw_content": raw_content,
+        "p_connector": connector,
+    }
+    if project_id is not None:
+        params["p_project_id"] = project_id
+    if store_id is not None:
+        params["p_store_id"] = store_id
+    if confidence is not None:
+        params["p_confidence"] = confidence
+    res = sb.rpc("rs_create_finding", params).execute()
+    return res.data

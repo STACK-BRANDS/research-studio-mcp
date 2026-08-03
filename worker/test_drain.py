@@ -461,8 +461,42 @@ def test_dispatch_web_fetch_partial_errors_alongside_progress_is_done(monkeypatc
     assert error is not None and "fetch_failed" in error
 
 
+# ---------------------------------------------------------------------------
+# jobs._dispatch -- collect branch (Phase 3), routed to worker.extract.run_collect.
+# run_collect's OWN behavior (admission control, budget, the extraction call) is
+# covered in worker/test_extract.py -- this only proves the wiring: _dispatch routes
+# job_kind='collect' to it, passes (job, claimant) through unchanged, and reports
+# 'done' with cost_cents=None (the ledger, not this job-spine column, is authoritative
+# for a collect job's real spend).
+# ---------------------------------------------------------------------------
+
+def test_dispatch_routes_collect_to_run_collect(monkeypatch):
+    from worker import extract
+
+    seen = {}
+
+    def _fake_run_collect(job, claimant):
+        seen["args"] = (job, claimant)
+        return {
+            "quotes_minted": 2, "quotes_rejected": 1,
+            "findings_minted": 1, "findings_rejected": 0,
+            "review_chars": 123,
+        }
+
+    monkeypatch.setattr(extract, "run_collect", _fake_run_collect)
+
+    job = {"id": "job-1", "job_kind": "collect",
+           "params": {"capture_id": "cap-1", "extractor_version": "text@v2"}}
+    result = jobs._dispatch(job, "claimant-1")
+
+    assert result == ("done", None, None)
+    assert seen["args"] == (job, "claimant-1")
+
+
 def test_dispatch_unimplemented_job_kind_fails_cleanly():
-    job = {"id": "job-1", "job_kind": "collect", "params": {}}
+    """`collect` is now a real handler (Phase 3) -- use `synthesize`, still genuinely
+    unimplemented (Task P4), so this test still proves what it claims to."""
+    job = {"id": "job-1", "job_kind": "synthesize", "params": {}}
     result = jobs._dispatch(job, "claimant-1")
     assert result == ("failed", None, "handler not implemented (P2-P4)")
 

@@ -337,17 +337,19 @@ def _spawn_heartbeat(job_id: str, claimant: str, job_kind: Optional[str]) -> _He
 
 def _dispatch(job: dict, claimant: str) -> tuple:
     """Route one claimed+running job to its handler by (job_kind,
-    connector). Two real handlers exist as of Phase 2: (scrape,
+    connector). Three real handlers exist as of Phase 3: (scrape,
     ad_library.scrapecreators) -> `worker.run.handle_scrape` (Task 1.6, the
-    ads-as-scrape reuse) and (scrape, web.fetch) ->
+    ads-as-scrape reuse), (scrape, web.fetch) ->
     `worker.connectors.web_fetch.capture_pages` (Phase 2, the static-HTML
-    site-capture connector). Every other (job_kind, connector) combination --
-    collect/verify/synthesize, and any scrape connector besides these two --
-    has no handler yet (Tasks P3-P4): it is finished 'failed' with a
-    clear, machine-greppable error rather than raising or crashing the
-    loop, so an as-yet-unimplemented job_kind can already be queued (e.g. by
-    a future planner) without taking down a worker that doesn't know how to
-    run it yet.
+    site-capture connector), and `collect` -> `worker.extract.run_collect`
+    (Phase 3, the extraction job: one site capture -> VoC quotes + site-fact
+    findings). Every other (job_kind, connector) combination -- verify/
+    synthesize, and any scrape connector besides the two above -- has no
+    handler yet (Task P4): it is finished 'failed' with a clear,
+    machine-greppable error rather than raising or crashing the loop, so an
+    as-yet-unimplemented job_kind can already be queued (e.g. by a future
+    planner) without taking down a worker that doesn't know how to run it
+    yet.
 
     Returns `(status, cost_cents, error)` -- `_run_claimed()` passes these
     straight through to `finish_job`. The scrape/ads branch's `error` is
@@ -409,6 +411,27 @@ def _dispatch(job: dict, claimant: str) -> tuple:
         total_ok = capture_result["captured"] + capture_result["unchanged"]
         status = "failed" if (plan and total_ok == 0 and capture_result["errors"]) else "done"
         return status, 0, error
+
+    if job_kind == "collect":
+        from worker import extract  # noqa: PLC0415 -- deferred; see docstring above (worker.extract
+        # imports worker.jobs at module level, for jobs.assert_lease's lease fences -- the same
+        # ordering hazard the scrape branches already document).
+        result = extract.run_collect(job, claimant)
+        logger.info(
+            "collect job %s: minted %d/%d quotes, %d/%d findings (review_chars=%d)",
+            job.get("id"),
+            result["quotes_minted"], result["quotes_minted"] + result["quotes_rejected"],
+            result["findings_minted"], result["findings_minted"] + result["findings_rejected"],
+            result["review_chars"],
+        )
+        # cost_cents is None here, not a computed dollar figure: the collect job's TRUE
+        # actual cost is already the ledger's own authoritative record (rs_settle_call,
+        # inside run_collect's own budget.settle() call) -- this per-job column is
+        # observability only and every other paid-call branch in this function follows
+        # the same "the ledger is authoritative, this column is not" convention (the
+        # scrape/ad_library.scrapecreators branch above passes through whatever
+        # handle_scrape computed, and never invents a second number here either).
+        return "done", None, None
 
     return "failed", None, "handler not implemented (P2-P4)"
 
