@@ -1,23 +1,28 @@
 """Ingestion: resolve a competitor's Meta platform id, pull their ads, dedup by
 ad_id, and fetch a capped set of creative images with an SSRF-safe downloader.
+
+The SSRF-safe download boundary itself (`_is_public_ip`, `_validate_url_host`,
+`_safe_download`, `MAX_IMAGE_BYTES`, `ALLOWED_SCHEMES`) now lives in
+`worker.net` (Phase 2: the web.fetch connector shares the exact same
+discipline for text/html) -- re-exported here UNCHANGED so every existing
+caller of `worker.ingest.<name>` keeps working with no behavior change.
 """
 
-import ipaddress
 import logging
 import re
-import socket
 from datetime import datetime, timezone
-from urllib.parse import urlparse
-
-import requests
 
 from src.services.scrapecreators_service import get_ads, get_platform_id
 from worker.config import settings
+from worker.net import (  # noqa: F401 -- re-exported for backward compatibility
+    ALLOWED_SCHEMES,
+    MAX_IMAGE_BYTES,
+    _is_public_ip,
+    _safe_download,
+    _validate_url_host,
+)
 
 logger = logging.getLogger(__name__)
-
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-ALLOWED_SCHEMES = {"http", "https"}
 
 
 def _norm(s: str) -> str:
@@ -168,80 +173,6 @@ def select_for_analysis(ads: list[dict], cap: int | None = None) -> list[dict]:
     # order-based fallback: front (fresh) + back (long-running)
     half = cap // 2
     return active[:half] + active[-(cap - half):]
-
-
-def _is_public_ip(ip_str: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
-
-
-def _validate_url_host(url: str) -> bool:
-    parsed = urlparse(url)
-    if parsed.scheme not in ALLOWED_SCHEMES or not parsed.hostname:
-        return False
-    try:
-        infos = socket.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror:
-        return False
-    return bool(infos) and all(_is_public_ip(info[4][0]) for info in infos)
-
-
-def _safe_download(url: str, cap_bytes: int = MAX_IMAGE_BYTES):
-    """Download `url` with an SSRF boundary: scheme allowlist, DNS-resolved
-    private/loopback/link-local/reserved/multicast/unspecified IP rejection,
-    at most one manually-validated redirect hop, image/* content-type only,
-    and a byte cap enforced both via Content-Length and while streaming.
-    Returns (raw_bytes, content_type) or None if any check fails.
-    """
-    if not _validate_url_host(url):
-        return None
-    try:
-        resp = requests.get(url, timeout=30, stream=True, allow_redirects=False)
-    except requests.RequestException:
-        return None
-
-    if 300 <= resp.status_code < 400:
-        location = resp.headers.get("Location")
-        if not location or not _validate_url_host(location):
-            return None
-        try:
-            resp = requests.get(location, timeout=30, stream=True, allow_redirects=False)
-        except requests.RequestException:
-            return None
-
-    if resp.status_code != 200:
-        return None
-
-    content_type = resp.headers.get("Content-Type", "")
-    if not content_type.startswith("image/"):
-        return None
-
-    content_length = resp.headers.get("Content-Length")
-    if content_length is not None:
-        try:
-            if int(content_length) > cap_bytes:
-                return None
-        except ValueError:
-            pass
-
-    chunks = []
-    total = 0
-    for chunk in resp.iter_content(chunk_size=65536):
-        total += len(chunk)
-        if total > cap_bytes:
-            return None
-        chunks.append(chunk)
-    return b"".join(chunks), content_type
 
 
 def fetch_images(distinct_ads: list[dict], cap: int | None = None) -> list[tuple[str, bytes, str]]:

@@ -347,16 +347,118 @@ def test_dispatch_passes_through_scrape_handler_error(monkeypatch):
 
 
 def test_dispatch_unknown_connector_fails_without_calling_any_handler(monkeypatch):
+    """web.fetch is now a mapped connector (Phase 2) -- use a genuinely
+    unmapped one here so this test still proves what it claims to."""
     from worker import run
+    from worker.connectors import web_fetch
     monkeypatch.setattr(
         run, "handle_scrape",
         lambda *a, **k: pytest.fail("handle_scrape must not be called for an unmapped connector"),
+    )
+    monkeypatch.setattr(
+        web_fetch, "capture_pages",
+        lambda *a, **k: pytest.fail("capture_pages must not be called for an unmapped connector"),
+    )
+
+    job = {"id": "job-1", "job_kind": "scrape", "params": {"connector": "some.other.connector"}}
+    result = jobs._dispatch(job, "claimant-1")
+
+    assert result == ("failed", None, "handler not implemented (P2-P4)")
+
+
+# ---------------------------------------------------------------------------
+# jobs._dispatch -- (scrape, web.fetch) branch (Phase 2), routed to
+# worker.connectors.web_fetch.capture_pages.
+# ---------------------------------------------------------------------------
+
+def test_dispatch_routes_scrape_web_fetch_to_capture_pages(monkeypatch):
+    from worker.connectors import web_fetch
+
+    seen = {}
+
+    def _fake_capture_pages(job, claimant, plan):
+        seen["args"] = (job, claimant, plan)
+        return {"captured": 3, "unchanged": 1, "robots_skipped": 0, "errors": []}
+
+    monkeypatch.setattr(web_fetch, "capture_pages", _fake_capture_pages)
+
+    job = {
+        "id": "job-1", "job_kind": "scrape",
+        "params": {"connector": "web.fetch", "plan": [{"url": "https://example.com/a"}]},
+    }
+    result = jobs._dispatch(job, "claimant-1")
+
+    assert result == ("done", 0, None)
+    assert seen["args"] == (job, "claimant-1", [{"url": "https://example.com/a"}])
+
+
+def test_dispatch_web_fetch_missing_plan_defaults_to_empty_list(monkeypatch):
+    from worker.connectors import web_fetch
+
+    seen = {}
+    monkeypatch.setattr(
+        web_fetch, "capture_pages",
+        lambda job, claimant, plan: seen.setdefault("plan", plan) or
+        {"captured": 0, "unchanged": 0, "robots_skipped": 0, "errors": []},
     )
 
     job = {"id": "job-1", "job_kind": "scrape", "params": {"connector": "web.fetch"}}
     result = jobs._dispatch(job, "claimant-1")
 
-    assert result == ("failed", None, "handler not implemented (P2-P4)")
+    assert seen["plan"] == []
+    assert result == ("done", 0, None)  # an empty plan is vacuous success, not a failure
+
+
+def test_dispatch_web_fetch_all_pages_failed_is_failed_status(monkeypatch):
+    from worker.connectors import web_fetch
+
+    monkeypatch.setattr(
+        web_fetch, "capture_pages",
+        lambda job, claimant, plan: {
+            "captured": 0, "unchanged": 0, "robots_skipped": 0,
+            "errors": [{"url": "https://example.com/a", "reason": "fetch_failed"}],
+        },
+    )
+
+    job = {
+        "id": "job-1", "job_kind": "scrape",
+        "params": {"connector": "web.fetch", "plan": [{"url": "https://example.com/a"}]},
+    }
+    result = jobs._dispatch(job, "claimant-1")
+
+    status, cost_cents, error = result
+    assert status == "failed"
+    assert cost_cents == 0
+    assert "1 of 1 page(s) did not capture" in error
+    assert "https://example.com/a: fetch_failed" in error
+
+
+def test_dispatch_web_fetch_partial_errors_alongside_progress_is_done(monkeypatch):
+    """Some pages failing while others captured/were-unchanged is partial
+    progress, not a failed job -- the error summary must still be present so
+    it is never silently lost."""
+    from worker.connectors import web_fetch
+
+    monkeypatch.setattr(
+        web_fetch, "capture_pages",
+        lambda job, claimant, plan: {
+            "captured": 1, "unchanged": 0, "robots_skipped": 0,
+            "errors": [{"url": "https://example.com/bad", "reason": "fetch_failed"}],
+        },
+    )
+
+    job = {
+        "id": "job-1", "job_kind": "scrape",
+        "params": {"connector": "web.fetch", "plan": [
+            {"url": "https://example.com/good"}, {"url": "https://example.com/bad"},
+        ]},
+    }
+    result = jobs._dispatch(job, "claimant-1")
+
+    status, cost_cents, error = result
+    assert status == "done"
+    assert cost_cents == 0
+    assert error is not None and "fetch_failed" in error
 
 
 def test_dispatch_unimplemented_job_kind_fails_cleanly():
