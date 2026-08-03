@@ -4,7 +4,7 @@ Service-role only (the tables are RLS deny-all to `authenticated`). Uses the new
 sb_secret_ service key — legacy anon/service_role keys are disabled on this project.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from supabase import create_client, Client
@@ -305,3 +305,382 @@ def finish_run(
         }).eq("id", run_id).execute()
     except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
         logger.warning("finish_run: could not record run finish for run_id=%s (%s)", run_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# Job spine (research_jobs) -- CAS claim/lease/heartbeat + stale-claim reaper.
+# Phase 1 tasks 1.2/1.3 of the deep-research plan (architecture §13 R1).
+#
+# Unlike the observability writes above, NONE of these are best-effort: a
+# claim/lease/finish mutation is a job-spine primitive whose caller (worker.
+# jobs) depends on an honest True/False (or raised exception) to decide
+# whether it still owns the row. Swallowing an exception here would hide a
+# real DB failure from a caller that needs to know about it to back off
+# safely -- so exceptions propagate; only "0 rows matched" collapses to a
+# clean False.
+# ---------------------------------------------------------------------------
+
+def claim_job(job_kind: Optional[str], claimant: str) -> Optional[dict]:
+    """Call the deployed `rs_claim_job` RPC: it does `FOR UPDATE SKIP LOCKED`
+    on the oldest queued row (optionally filtered to `job_kind`), stamps
+    status='claimed', claimed_by=claimant, claimed_at=now(), and returns the
+    claimed row -- or nothing if no row was queued for this kind. The claim
+    (and the SKIP LOCKED concurrency guarantee) is entirely the database's;
+    this function never reimplements it in Python.
+
+    `job_kind=None` omits the `p_job_kind` param entirely (rather than
+    sending an explicit null), so the RPC's own default (any kind, oldest
+    first) applies.
+    """
+    sb = _client()
+    params = {"p_claimed_by": claimant}
+    if job_kind is not None:
+        params["p_job_kind"] = job_kind
+    res = sb.rpc("rs_claim_job", params).execute()
+    data = res.data
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
+
+def claim_job_by_id(job_id: str, claimant: str) -> Optional[dict]:
+    """CAS research_jobs: queued -> claimed for one SPECIFIC job_id, rather
+    than the next-oldest-queued-of-any-kind row `claim_job`/`rs_claim_job`
+    picks. This is the CLI's "claim the exact job I just enqueued (or the
+    same-day duplicate I'm re-attempting), never the whole queue" path
+    (Task 1.7, P1-4/P1-5 fix) -- `worker.jobs.run_one` is the only caller.
+    Stamps `claimed_by=claimant`, `claimed_at=now()`. Returns the claimed
+    row, or None if `job_id` was no longer 'queued' by the time this ran
+    (already claimed/running by something else, or already terminal) -- the
+    caller must not assume it now owns the job.
+
+    NOT best-effort (see the job-spine banner above): this is a job-spine
+    CAS primitive whose caller depends on an honest row/None to decide
+    whether it claimed the job; only "0 rows matched" collapses to a clean
+    None, any other failure (network, DB) propagates unchanged.
+    """
+    sb = _client()
+    res = (
+        sb.table("research_jobs")
+        .update({
+            "status": "claimed",
+            "claimed_by": claimant,
+            "claimed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", job_id)
+        .eq("status", "queued")
+        .execute()
+    )
+    data = res.data
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
+
+def mark_job_running(job_id: str, claimant: str) -> bool:
+    """CAS research_jobs: claimed -> running, stamping started_at. True iff a
+    row matched (this claimant still held the claim); False means the lease
+    was already revoked (0 rows affected) and the caller must abort without
+    running the handler at all."""
+    sb = _client()
+    res = (
+        sb.table("research_jobs")
+        .update({"status": "running", "started_at": datetime.now(timezone.utc).isoformat()})
+        .eq("id", job_id)
+        .eq("claimed_by", claimant)
+        .eq("status", "claimed")
+        .execute()
+    )
+    return bool(res.data)
+
+
+def heartbeat_job(job_id: str, claimant: str) -> bool:
+    """CAS research_jobs: bump claimed_at while status stays 'running', so a
+    live, still-working claimant's lease never goes stale under the reaper's
+    timeout. True iff this claimant still holds the running lease; False
+    means it was already revoked -- the caller must stop and abort."""
+    sb = _client()
+    res = (
+        sb.table("research_jobs")
+        .update({"claimed_at": datetime.now(timezone.utc).isoformat()})
+        .eq("id", job_id)
+        .eq("claimed_by", claimant)
+        .eq("status", "running")
+        .execute()
+    )
+    return bool(res.data)
+
+
+def job_lease_held(job_id: str, claimant: str) -> bool:
+    """Read-only fence check: True iff `claimant` currently holds a 'running'
+    lease on `job_id`. Callers must check this immediately before any
+    external write or spend inside a handler and abort doing nothing on
+    False."""
+    sb = _client()
+    res = (
+        sb.table("research_jobs")
+        .select("id")
+        .eq("id", job_id)
+        .eq("claimed_by", claimant)
+        .eq("status", "running")
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+
+def finish_job(
+    job_id: str,
+    claimant: str,
+    status: str,
+    error: Optional[str] = None,
+    cost_cents: Optional[int] = None,
+    result: Optional[dict] = None,
+) -> bool:
+    """CAS research_jobs: running -> done|failed (terminal), stamping
+    finished_at plus any of error/cost_cents/result that were passed (a
+    field left as None is omitted from the update, never written over an
+    existing value with a bare null). True iff this claimant still held the
+    running lease at the moment of finishing; False means the lease was
+    revoked mid-run (the reaper already re-queued the job as a fresh
+    attempt) and the caller's result must be discarded, not written."""
+    sb = _client()
+    update: dict = {"status": status, "finished_at": datetime.now(timezone.utc).isoformat()}
+    if error is not None:
+        update["error"] = error
+    if cost_cents is not None:
+        update["cost_cents"] = cost_cents
+    if result is not None:
+        update["result"] = result
+    res = (
+        sb.table("research_jobs")
+        .update(update)
+        .eq("id", job_id)
+        .eq("claimed_by", claimant)
+        .eq("status", "running")
+        .execute()
+    )
+    return bool(res.data)
+
+
+def rs_reserve_spend(
+    job_id: str,
+    project_id: str,
+    ref: str,
+    est_cents: int,
+    claimant: str,
+    connector: Optional[str] = None,
+) -> str:
+    """Call the deployed `rs_reserve_spend` RPC (migration 138): a
+    project-scoped, worst-case spend reservation over `research_budget_ledger`,
+    guarded server-side by the job's lease (`claimed_by=claimant AND
+    status='running'`), the project's binding/approval state, and its budget
+    ceiling. `p_est_cents` MUST be the worst-case ceiling for the call (see
+    `worker.config.Settings.price_cards`) -- the RPC enforces that the
+    project's committed spend (actual + outstanding reservations) plus this
+    reservation never exceeds `research_projects.budget_cents`.
+
+    Returns the RPC's own scalar text result: `'ok'` (a fresh reserve was
+    recorded -- the caller MAY make the paid call) or `'skip'` (a reserve for
+    this exact `ref` already exists -- a replay; the caller must NOT call the
+    provider again).
+
+    NOT best-effort (see the job-spine banner above): any guard failure
+    inside the RPC -- lease not held, job not bound to `project_id`, project
+    not approved, ceiling would be exceeded -- RAISES and propagates here
+    unchanged. `worker.budget.reserve()` must not swallow this; a caller that
+    cannot tell "blocked" from "allowed" could make an unreserved paid call.
+
+    `connector` is omitted from the RPC params entirely when None (rather
+    than sent as an explicit null), matching `claim_job`'s convention for
+    optional RPC params.
+    """
+    sb = _client()
+    params: dict = {
+        "p_job_id": job_id,
+        "p_project_id": project_id,
+        "p_ref": ref,
+        "p_est_cents": est_cents,
+        "p_claimant": claimant,
+    }
+    if connector is not None:
+        params["p_connector"] = connector
+    res = sb.rpc("rs_reserve_spend", params).execute()
+    return res.data
+
+
+def rs_settle_call(ref: str, actual_cents: int, claimant: Optional[str] = None) -> None:
+    """Call the deployed `rs_settle_call` RPC (migration 138): records the
+    TRUE actual cost for `ref` in `research_budget_ledger` and releases its
+    reservation hold. Idempotent server-side -- calling it twice for the same
+    `ref` is a no-op. Requires a matching `rs_reserve_spend` reserve to
+    already exist for `ref`.
+
+    NOT best-effort (see the job-spine banner above): any RPC failure (no
+    matching reserve, RPC/DB error) propagates unchanged -- a settle call
+    that silently swallowed a failure would leave the ledger's reservation
+    hold in place forever, understating the project's available budget.
+
+    `claimant` is omitted from the RPC params entirely when None, matching
+    `rs_reserve_spend`'s convention for optional RPC params.
+    """
+    sb = _client()
+    params: dict = {"p_ref": ref, "p_actual_cents": actual_cents}
+    if claimant is not None:
+        params["p_claimant"] = claimant
+    sb.rpc("rs_settle_call", params).execute()
+
+
+def reap_stale_jobs(job_kind: str, timeout_seconds: int) -> int:
+    """Re-queue every `job_kind` row stuck in claimed/running whose
+    claimed_at is older than `timeout_seconds` (a dead worker: it stopped
+    heartbeating). A single server-side UPDATE -- no read-then-write race.
+    A live worker calling heartbeat_job() keeps claimed_at fresh and is never
+    matched by this filter. Returns the number of rows re-queued."""
+    sb = _client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).isoformat()
+    # Deliberately NOT fenced on claimed_by (P1-6, reviewed and rejected as a
+    # fix): the reaper's whole job is to reclaim ANY dead worker's stale
+    # claim, and there is no single claimant to CAS against here -- it must
+    # match every claimant whose claimed_at has gone cold, not one specific
+    # one. A live worker's own heartbeat keeps its claimed_at fresh, so it is
+    # never matched by the `lt(claimed_at, cutoff)` filter regardless of
+    # whose claimed_by is on the row.
+    res = (
+        sb.table("research_jobs")
+        .update({"status": "queued", "claimed_by": None})
+        .in_("status", ["claimed", "running"])
+        .eq("job_kind", job_kind)
+        .lt("claimed_at", cutoff)
+        .execute()
+    )
+    return len(res.data or [])
+
+
+def enqueue_job(
+    job_kind: str,
+    params: dict,
+    idempotency_key: str,
+    project_id: Optional[str] = None,
+    competitor_id: Optional[str] = None,
+    store_id: Optional[str] = None,
+) -> Optional[str]:
+    """Insert a new `research_jobs` row (Task 1.7). `status` is omitted from
+    the payload entirely -- the column's own DB default ('queued') applies,
+    same convention as every optional field below.
+
+    Duplicate enqueue (an `idempotency_key` that already exists -- e.g. a
+    retried CLI invocation for the same brand/day, Task 1.1's R4 keys) is a
+    SILENT NO-OP: returns None rather than raising or returning the existing
+    row's id, so a caller only ever gets an id back for a job it actually
+    just caused to be inserted.
+
+    Implemented as `upsert(..., on_conflict="idempotency_key",
+    ignore_duplicates=True)` -- i.e. PostgREST's own translation of that
+    flag combination is `INSERT ... ON CONFLICT (idempotency_key) DO
+    NOTHING` -- rather than a plain `insert()` wrapped in a caught 23505.
+    Chosen because DO NOTHING is race-free against a second, concurrent
+    enqueuer for the exact same key (the conflict is resolved entirely
+    server-side, in the same statement, with no separate error path to
+    parse) and because a conflicting row is simply never returned in
+    `.data` -- PostgREST never touched it -- so an EMPTY `.data` is itself
+    the unambiguous duplicate signal, with no need to inspect an exception's
+    error code at all.
+
+    `project_id`/`competitor_id`/`store_id` are omitted from the insert
+    payload entirely when None (matching `claim_job`/`rs_reserve_spend`'s
+    existing convention for optional columns/params elsewhere in this
+    module), rather than sent as explicit JSON nulls -- both are equivalent
+    for a nullable column, but omitting keeps the payload minimal and
+    consistent with the rest of this file.
+    """
+    sb = _client()
+    row: dict = {
+        "job_kind": job_kind,
+        "params": params,
+        "idempotency_key": idempotency_key,
+    }
+    if project_id is not None:
+        row["project_id"] = project_id
+    if competitor_id is not None:
+        row["competitor_id"] = competitor_id
+    if store_id is not None:
+        row["store_id"] = store_id
+    res = (
+        sb.table("research_jobs")
+        .upsert(row, on_conflict="idempotency_key", ignore_duplicates=True)
+        .execute()
+    )
+    if not res.data:
+        return None
+    return res.data[0]["id"]
+
+
+def job_status_for_idem(idempotency_key: str) -> Optional[str]:
+    """Read a job's current status by its idempotency_key.
+
+    Kept as a general-purpose status-only read (P1-4/P1-5 fix note: the CLI
+    `worker.run.main` no longer calls this after a whole-queue `drain()` --
+    it now calls `jobs.run_one()` directly for an authoritative terminal
+    status, and uses `find_job_by_idem` below, not this function, on the
+    same-day-duplicate path where it needs BOTH the id and the status). This
+    stays available as the narrower status-only read for any other caller
+    that only needs the status string.
+
+    Unlike the CAS mutations above (which propagate exceptions because their
+    caller depends on an honest True/False), this is a READ that only feeds
+    a best-effort SIGNAL, and a job's real outcome is independently recorded
+    in `research_jobs` itself (and, for the ads path, `research_runs` via
+    `finish_run`). So it is deliberately best-effort: returns the status
+    string, or None if the row is absent or the read failed -- a lost read
+    here must never itself crash a caller or mask an already-persisted
+    outcome."""
+    try:
+        sb = _client()
+        res = (
+            sb.table("research_jobs")
+            .select("status")
+            .eq("idempotency_key", idempotency_key)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0].get("status")
+        return None
+    except Exception as exc:  # noqa: BLE001 — best-effort exit-code signal only
+        logger.warning("job_status_for_idem: could not read status for %s (%s)", idempotency_key, exc)
+        return None
+
+
+def find_job_by_idem(idempotency_key: str) -> Optional[dict]:
+    """Read `{"id": ..., "status": ...}` for the research_jobs row with this
+    idempotency_key, or None if absent or the read failed.
+
+    Used by `worker.run.main` on a same-day duplicate enqueue (Task 1.1/R4:
+    `jobs.enqueue` returned None because the row already exists) to find
+    that EXISTING job's id -- so it can call `jobs.run_one` on it if it's
+    still 'queued' (e.g. an earlier invocation died before even claiming) --
+    and its current status, if it's already claimed/running/terminal
+    (P1-4/P1-5 fix: `main` needs both fields here, unlike the status-only
+    `job_status_for_idem` above).
+
+    Best-effort, same contract as `job_status_for_idem`: this is a READ that
+    only feeds `main`'s target-selection/exit-code logic, and the run's real
+    outcome is independently recorded in `research_jobs`/`research_runs`
+    regardless -- a lost read here must never crash the CLI."""
+    try:
+        sb = _client()
+        res = (
+            sb.table("research_jobs")
+            .select("id, status")
+            .eq("idempotency_key", idempotency_key)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            row = res.data[0]
+            return {"id": row.get("id"), "status": row.get("status")}
+        return None
+    except Exception as exc:  # noqa: BLE001 — best-effort read only
+        logger.warning("find_job_by_idem: could not read job for %s (%s)", idempotency_key, exc)
+        return None
