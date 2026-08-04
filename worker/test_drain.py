@@ -502,9 +502,44 @@ def test_dispatch_unimplemented_job_kind_fails_cleanly():
 
 
 def test_dispatch_handles_missing_params():
-    job = {"id": "job-1", "job_kind": "verify", "params": None}
+    """`verify` is now a real handler too (Phase 4) -- use `synthesize`, still genuinely
+    unimplemented (Task P4), so this test still proves what it claims to."""
+    job = {"id": "job-1", "job_kind": "synthesize", "params": None}
     result = jobs._dispatch(job, "claimant-1")
     assert result == ("failed", None, "handler not implemented (P2-P4)")
+
+
+# ---------------------------------------------------------------------------
+# jobs._dispatch -- verify branch (Phase 4), routed to worker.verify.run_verify.
+# run_verify's OWN behavior (freeze/integrity/per-member checks, budget, the label-pass
+# call) is covered in worker/test_verify.py -- this only proves the wiring: _dispatch
+# routes job_kind='verify' to it, passes (job, claimant) through unchanged, and reports
+# `jobs._STATUS_ALREADY_FINALIZED` (NEVER the literal "done" -- P1-C: rs_verify_finalize
+# already committed the terminal research_jobs.status transition itself, server-side;
+# see `_run_claimed`'s handling of the sentinel below) with cost_cents=None (the ledger,
+# not this job-spine column, is authoritative for a verify job's real spend).
+# ---------------------------------------------------------------------------
+
+def test_dispatch_routes_verify_to_run_verify(monkeypatch):
+    from worker import verify
+
+    seen = {}
+
+    def _fake_run_verify(job, claimant):
+        seen["args"] = (job, claimant)
+        return {
+            "members_frozen": 3, "supported": 2, "unsupported": 1, "abstained": 0,
+            "integrity_failed": 0, "unauthenticatable": 0, "verdict": {"status": "ok"},
+        }
+
+    monkeypatch.setattr(verify, "run_verify", _fake_run_verify)
+
+    job = {"id": "job-1", "job_kind": "verify",
+           "params": {"capture_id": "cap-1", "verifier_version": "v1"}}
+    result = jobs._dispatch(job, "claimant-1")
+
+    assert result == (jobs._STATUS_ALREADY_FINALIZED, None, None)
+    assert seen["args"] == (job, "claimant-1")
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +802,36 @@ def test_run_claimed_returns_terminal_status_on_success(drain_stubs):
     assert drain_stubs["finish_job"][0]["status"] == "done"
     assert drain_stubs["finish_job"][0]["claimant"] == "claimant-1"
     assert drain_stubs["heartbeats"][0].stopped is True
+
+
+def test_run_claimed_treats_already_finalized_verify_dispatch_as_success_without_finish_job(drain_stubs):
+    """P1-C: a verify job's `_dispatch` result is `(_STATUS_ALREADY_FINALIZED, None,
+    None)` -- `rs_verify_finalize` already CASed research_jobs.status to 'done' itself,
+    server-side, atomically with the verdict. `_run_claimed` must report this as a
+    SUCCESSFUL terminal completion ("done", never None/failed) WITHOUT ever calling
+    finish_job -- calling it would CAS against status='running', match ZERO rows (status
+    is already 'done'), and be misread as a revoked lease."""
+    drain_stubs["state"]["dispatch_result"] = (jobs._STATUS_ALREADY_FINALIZED, None, None)
+    job = {"id": "job-1", "job_kind": "verify", "params": {"capture_id": "cap-1"}}
+
+    result = jobs._run_claimed(job, "claimant-1")
+
+    assert result == "done"
+    assert drain_stubs["finish_job"] == []
+    assert drain_stubs["heartbeats"][0].stopped is True
+
+
+def test_drain_counts_already_finalized_verify_job_as_processed(drain_stubs):
+    """Same P1-C behavior through the full drain() poll loop: an already-finalized
+    verify dispatch must still count as a processed job (drain()'s count increments,
+    since _run_claimed returned "done", not None) and must never call finish_job."""
+    drain_stubs["state"]["queue"] = [{"id": "job-1", "job_kind": "verify", "params": {}}]
+    drain_stubs["state"]["dispatch_result"] = (jobs._STATUS_ALREADY_FINALIZED, None, None)
+
+    count = jobs.drain(once=True)
+
+    assert count == 1
+    assert drain_stubs["finish_job"] == []
 
 
 def test_run_claimed_returns_failed_status_and_stops_heartbeat_on_exception(drain_stubs):

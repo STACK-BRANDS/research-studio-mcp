@@ -1085,3 +1085,242 @@ def create_finding(
     params["p_capture_id"] = capture_id
     res = sb.rpc("rs_create_finding", params).execute()
     return res.data
+
+
+# ---------------------------------------------------------------------------
+# P4 VERIFICATION (the `verify` job) -- thin wrappers over the deployed evidence-
+# verification RPCs (migration 150) plus two read-back helpers for the evidence rows a
+# frozen sample member points at. Same job-spine banner as P3 EXTRACTION above: NONE of
+# these are best-effort. `worker.verify.run_verify` depends on an honest read/RPC result
+# to decide a member's outcome or the capture's verdict -- silently swallowing a failure
+# here could either record a fabricated 'supported' verdict or hide a real infrastructure
+# failure behind a false "nothing to verify". Every RPC wrapper below is fenced
+# server-side on (job_kind='verify', claimed_by=p_claim_token, status='running') exactly
+# like `rs_reserve_spend`/`rs_settle_call` are fenced on the collect/scrape job spine --
+# a stale/revoked claim raises from the RPC itself, and that raise propagates unchanged.
+# ---------------------------------------------------------------------------
+
+def rs_verify_freeze_sample(job_id: str, claim_token: str) -> list:
+    """Call the deployed `rs_verify_freeze_sample` RPC: freezes (or, on a replay within
+    the same claim, re-returns) this verify job's sample of `research_verify_sample_members`
+    rows -- each `{job_id, evidence_kind, evidence_id, capture_id, sample_rank,
+    result='pending'}` (a member already terminalized by an EARLIER call -- e.g. a replay
+    after `rs_verify_record_integrity` already bulk-terminalized some rows -- comes back
+    with its current, non-'pending' `result`, not reset to 'pending').
+
+    Idempotent: re-calling with the same `(job_id, claim_token)` returns the SAME frozen
+    set rather than re-sampling, so a crash-replay within one claim never draws a
+    different sample out from under an in-progress verify run.
+
+    Returns a plain list -- possibly EMPTY. A 0-member sample is a legitimate, valid
+    outcome (nothing matched this job's verification scope), never an error: `worker.
+    verify.run_verify` still runs the capture-integrity check and finalizes even when
+    this returns `[]`, because `rs_verify_finalize` authenticates the CAPTURE regardless
+    of how many evidence rows happened to land in the sample.
+
+    NOT best-effort: any RPC failure (the fence rejecting a stale/wrong claim_token, a
+    job_id that isn't a 'verify' job, a DB error) propagates unchanged.
+    """
+    sb = _client()
+    res = sb.rpc(
+        "rs_verify_freeze_sample", {"p_job_id": job_id, "p_claim_token": claim_token},
+    ).execute()
+    return res.data or []
+
+
+def rs_verify_record_integrity(
+    job_id: str,
+    claim_token: str,
+    observed_txt_sha256: Optional[str],
+    observed_html_sha256: Optional[str],
+    txt_missing: bool,
+    html_missing: bool,
+) -> dict:
+    """Call the deployed `rs_verify_record_integrity` RPC: records the up-front
+    capture-integrity result for this verify job's `verify_capture_id`, comparing the
+    CALLER-OBSERVED hashes of the freshly re-downloaded canonical `.txt` and raw `.html`
+    storage objects against the capture row's own recorded hashes.
+
+    STRICT input rule enforced RPC-side (not re-validated here -- the RPC is the real
+    guarantee, this wrapper never second-guesses it): per object, exactly ONE of
+    `(observed_..._sha256=<64-hex>, ..._missing=False)` or
+    `(observed_..._sha256=None, ..._missing=True)` must hold, or the RPC raises
+    `invalid_integrity_report`. `worker.verify.run_verify` is the caller responsible for
+    upholding this (see its `_download_hash_or_missing` helper).
+
+    The RPC alone decides ok/mismatch/object_missing/unauthenticatable and bulk-
+    terminalizes this job's pending sample members accordingly (a mismatch or missing
+    object marks every still-pending member 'integrity_failed'; an unauthenticatable
+    capture -- its own `content_sha256`/`raw_html_sha256` is null/malformed on the capture
+    row itself -- marks them 'unauthenticatable'). This wrapper's caller does NOT branch
+    on the RPC's own verdict beyond passing the observed hashes/flags through -- it simply
+    re-reads member status afterward (`get_verify_sample_members`) to see what, if
+    anything, is still 'pending'.
+
+    Called exactly ONCE per verify run, up-front, immediately after `rs_verify_freeze_
+    sample` -- never per-member, and never skipped even for a 0-member sample (a 0-member
+    sample must still authenticate the capture, since `rs_verify_finalize` refuses to run
+    until integrity has been recorded).
+
+    NOT best-effort: any RPC failure (the fence, `invalid_integrity_report`, a DB error)
+    propagates unchanged.
+    """
+    sb = _client()
+    params = {
+        "p_job_id": job_id,
+        "p_claim_token": claim_token,
+        "p_observed_txt_sha256": observed_txt_sha256,
+        "p_observed_html_sha256": observed_html_sha256,
+        "p_txt_missing": txt_missing,
+        "p_html_missing": html_missing,
+    }
+    res = sb.rpc("rs_verify_record_integrity", params).execute()
+    return res.data
+
+
+def rs_verify_record_outcome(
+    job_id: str,
+    claim_token: str,
+    evidence_kind: str,
+    evidence_id: str,
+    result: str,
+    check_detail: Optional[dict] = None,
+) -> dict:
+    """Call the deployed `rs_verify_record_outcome` RPC: records the per-occurrence
+    ledger outcome for ONE frozen sample member -- `result` MUST be one of
+    `'supported' | 'unsupported' | 'abstained'`.
+
+    RPC-side fencing (not re-validated here) requires: the claim fence holds, integrity
+    was already recorded for this job AND both objects came back 'ok' (a member the
+    integrity step itself already terminalized -- 'integrity_failed'/'unauthenticatable'
+    -- is NOT a legal target here; `worker.verify.run_verify` must never call this for a
+    member it did not itself find still 'pending'), the `(evidence_kind, evidence_id)`
+    pair is actually in this job's frozen sample, and the member is currently 'pending'
+    (pending -> terminal exactly once; a repeat call for an already-terminal member
+    raises rather than silently overwriting a recorded verdict).
+
+    `check_detail` defaults to `{}` (never `None` on the wire) -- the RPC's jsonb column
+    is NOT NULL. Pass whatever the caller's own check produced: for a deterministic
+    verbatim/grounding failure, `{"reason": "verbatim_failed", ...}`; for the adversarial
+    label pass, `{"model": ..., "rationale_hash": ..., "input_tokens": ...,
+    "output_tokens": ...}` (or a `"reason"` key for an abstain).
+
+    NOT best-effort: any RPC failure (the fence, "not in sample", "already terminal", a
+    DB error) propagates unchanged -- `run_verify`'s per-member loop is the one place
+    that decides what a given failure means, this wrapper never swallows it.
+    """
+    sb = _client()
+    params = {
+        "p_job_id": job_id,
+        "p_claim_token": claim_token,
+        "p_evidence_kind": evidence_kind,
+        "p_evidence_id": evidence_id,
+        "p_result": result,
+        "p_check_detail": check_detail if check_detail is not None else {},
+    }
+    res = sb.rpc("rs_verify_record_outcome", params).execute()
+    return res.data
+
+
+def rs_verify_finalize(job_id: str, claim_token: str) -> dict:
+    """Call the deployed `rs_verify_finalize` RPC: computes this verify job's CAPTURE
+    verdict from the recorded integrity result + the per-member outcome ledger, derives
+    and stamps every sampled evidence row's `verification_status` from that ledger, and
+    sets the job itself 'done'.
+
+    Refuses (raises) while any frozen sample member is still 'pending', and refuses if
+    integrity was never recorded at all -- `worker.verify.run_verify` must always call
+    `rs_verify_record_integrity` first and drive every member to a terminal result before
+    calling this, even for a 0-member sample (integrity-only capture authentication).
+
+    Idempotent: a replay (same job_id, same claim_token, job already 'done') returns the
+    SAME stored verdict rather than recomputing or erroring -- a crash-replay after a
+    successful finalize is safe to re-run.
+
+    NOT best-effort: any RPC failure (the "still pending" / "integrity not recorded"
+    refusals, the fence, a DB error) propagates unchanged -- `run_verify` has no
+    reasonable fallback for a finalize that didn't actually happen.
+    """
+    sb = _client()
+    res = sb.rpc(
+        "rs_verify_finalize", {"p_job_id": job_id, "p_claim_token": claim_token},
+    ).execute()
+    return res.data
+
+
+def get_verify_sample_members(job_id: str, result: Optional[str] = None) -> list:
+    """Read back this verify job's `research_verify_sample_members` rows -- `{job_id,
+    evidence_kind, evidence_id, capture_id, sample_rank, result}` each -- optionally
+    filtered to one `result` value (e.g. `result="pending"`, the caller's usual need: find
+    what is left to process after `rs_verify_record_integrity` may have bulk-terminalized
+    some rows).
+
+    A plain table SELECT, not an RPC -- there is no fencing concern on a READ. Used by
+    `worker.verify.run_verify` to re-discover which members are still 'pending' after the
+    up-front integrity call (the RPC's own bulk-terminalize doesn't hand back an updated
+    member list, only its own capture-level verdict), and to tally final per-result counts
+    for the job's returned summary.
+
+    NOT best-effort: `run_verify` depends on an honest read to decide which members to
+    process next; any failure other than a clean (possibly empty) result set propagates
+    unchanged.
+    """
+    sb = _client()
+    query = (
+        sb.table("research_verify_sample_members")
+        .select("job_id, evidence_kind, evidence_id, capture_id, sample_rank, result")
+        .eq("job_id", job_id)
+    )
+    if result is not None:
+        query = query.eq("result", result)
+    res = query.execute()
+    return res.data or []
+
+
+def get_voc_quote(quote_id: str) -> Optional[dict]:
+    """Read one `research_voc_quotes` row by id -- `quote`, `type`, `theme`,
+    `product_area`, `confidence`, `source_url`, `capture_id` -- everything `worker.
+    verify.run_verify` needs to re-check a 'voc' sample member's quote text against a
+    freshly re-extracted, hash-authenticated review text, and to build the adversarial
+    label pass's LABEL payload.
+
+    Returns None if no row matches this id. NOT best-effort: a missing quote row for a
+    frozen sample member is a real anomaly (the sample member references it by id), not a
+    silent "nothing to verify" -- the caller decides how to score that (abstain, never a
+    false 'unsupported'), it is not this wrapper's call to make.
+    """
+    sb = _client()
+    res = (
+        sb.table("research_voc_quotes")
+        .select("id, quote, type, theme, product_area, confidence, source_url, capture_id")
+        .eq("id", quote_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return None
+    return res.data[0]
+
+
+def get_finding(finding_id: str) -> Optional[dict]:
+    """Read one `research_findings` row by id -- `finding_kind`, `schema_version`,
+    `payload` (jsonb: `fact_type`/`statement`/`detail` for a `site_fact` v1 row),
+    `source_url`, `capture_id`, `confidence` -- everything `worker.verify.run_verify`
+    needs to re-check a 'finding' sample member's grounding against a freshly
+    re-extracted, hash-authenticated canonical text, and to build the adversarial label
+    pass's LABEL payload.
+
+    Returns None if no row matches this id. NOT best-effort, same reasoning as
+    `get_voc_quote` above.
+    """
+    sb = _client()
+    res = (
+        sb.table("research_findings")
+        .select("id, finding_kind, schema_version, payload, source_url, capture_id, confidence")
+        .eq("id", finding_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return None
+    return res.data[0]
