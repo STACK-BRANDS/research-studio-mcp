@@ -102,12 +102,16 @@ Order of operations (do not reorder without re-reading the reasoning below):
        - Findings: dropped (`findings_rejected`) unless `fact_type` is one of the seven
          registered `site_fact` v1 values, `statement` is non-blank, AND `evidence` (a
          VERBATIM snippet the model claims supports the fact) normalizes to a substring of
-         the normalized CANONICAL text -- a deterministic grounding gate, since
-         `rs_create_finding` is registry-gated but NOT verbatim-gated the way quotes are,
-         so this Python layer is the only thing standing between a prompt-injected
-         fabrication and a minted "page fact". Minted with `raw_content=canonical_text` --
-         a finding is a page FACT, not customer voice, so it is evidenced against the
-         whole page, not the review-widget text.
+         the normalized CANONICAL text -- a deterministic grounding gate, mirroring the
+         quote-side A-1 check. `evidence` is minted as its OWN first-class field in the
+         persisted `payload` (alongside `fact_type`/`statement`/optional `detail`), never
+         discarded -- so the registered `site_fact` payload/schema can be gated at the DB
+         the same way (a companion migration re-runs this exact normalized-substring check
+         server-side), and the verify pass has an authoritative span to re-check later
+         instead of abstaining. This Python check remains defense-in-depth ahead of that
+         DB gate, not the sole backstop. Minted with `raw_content=canonical_text` -- a
+         finding is a page FACT, not customer voice, so it is evidenced against the whole
+         page, not the review-widget text.
        - Either kind: any RPC rejection that looks like the RPC's OWN validation raise
          (`_is_content_rejection` -- a fabrication this pre-check's normalization missed, a
          span mismatch, connector not enabled, unregistered finding kind, a missing
@@ -244,15 +248,16 @@ def _finding_schema() -> dict:
             "evidence": {"type": "string"},
             "confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
         },
-        # `detail` and `evidence` are REQUIRED here (Anthropic strict structured-output
-        # rule: every property must be listed in `required` when additionalProperties is
-        # false) even though only `detail` is OPTIONAL in the registered `site_fact` v1
-        # payload schema -- the model may return "" for "no additional detail". `evidence`
-        # is NOT part of that registered payload at all: it is the deterministic
-        # grounding gate `_mint_findings` checks BEFORE minting (a normalized-substring
-        # match against the canonical page text, mirroring the quote-side A-1 check), and
-        # is never sent to the RPC directly -- it is folded into `detail` only when
-        # `detail` is otherwise blank, or simply discarded once the gate has used it.
+        # `detail` and `evidence` are both REQUIRED here (Anthropic strict structured-
+        # output rule: every property must be listed in `required` when
+        # additionalProperties is false) even though `detail` is OPTIONAL in the
+        # registered `site_fact` v1 payload schema -- the model may return "" for "no
+        # additional detail". `evidence` is now REQUIRED and first-class in that
+        # registered payload too: `_mint_findings` uses it BOTH as the deterministic
+        # grounding gate (a normalized-substring match against the canonical page text,
+        # mirroring the quote-side A-1 check) AND persists it verbatim in `payload`,
+        # alongside `detail`, so `verify.py` has an authoritative verbatim span to
+        # re-check against later instead of abstaining.
         "required": ["fact_type", "statement", "detail", "evidence", "confidence"],
     }
 
@@ -465,15 +470,22 @@ def _mint_findings(
 ) -> tuple:
     """Admission-control + mint every candidate finding. Returns (minted, rejected).
 
-    Admission control now includes a deterministic grounding gate (FIX 7): a finding is
-    minted on evidence, never on the model's say-so alone. `rs_create_finding` is
-    registry-gated (a valid `fact_type`/`schema_version` pair, an enabled connector) but
-    NOT verbatim-gated the way `rs_create_voc_quote` is -- so this Python layer requires a
+    Admission control includes a deterministic grounding gate (FIX 7): a finding is
+    minted on evidence, never on the model's say-so alone. This Python layer requires a
     non-blank `evidence` field and drops the finding unless `evidence`, normalized the same
     way a quote is (`normalize_text`), is a substring of the normalized CANONICAL page
-    text. `evidence` itself is never sent to the RPC (the registered `site_fact` v1 payload
-    is `{fact_type, statement, detail?}`) -- it is folded into `detail` only when `detail`
-    is otherwise blank, or simply discarded once the gate has used it.
+    text.
+
+    `evidence` is persisted FIRST-CLASS in `payload` -- `{fact_type, statement, evidence,
+    detail?}` -- never folded into `detail` and never discarded once the gate has used it,
+    mirroring how `rs_create_voc_quote` is verbatim-gated: the registered `site_fact` v1
+    payload/schema is gated at the DB the same way (a companion migration re-runs this
+    exact normalized-substring check server-side against `p_raw_content`), so this Python
+    check is defense-in-depth ahead of that DB gate, not the sole backstop. Persisting
+    `evidence` also gives `worker.verify`'s finding branch an authoritative verbatim span
+    to re-check against a freshly re-downloaded page, instead of abstaining for lack of
+    anything to re-ground against (the KNOWN GAP `worker.verify` used to document is
+    closed by this field existing).
 
     `jobs.assert_lease(job_id, claimant)` is checked immediately before EACH
     `store.create_finding` call, same discipline as `_mint_quotes` (FIX 6).
@@ -508,13 +520,13 @@ def _mint_findings(
             continue
 
         detail = (candidate.get("detail") or "").strip()
-        if not detail:
-            # `detail` was otherwise blank -- surface the verbatim evidence there instead
-            # of discarding it; the registered payload schema has no separate `evidence`
-            # field.
-            detail = evidence
 
-        payload: dict = {"fact_type": fact_type, "statement": statement}
+        # `evidence` is persisted FIRST-CLASS (no longer folded into `detail`): it is the
+        # verbatim span this gate just confirmed is substring-present in the canonical
+        # page text, so it stays available -- unchanged -- for `worker.verify` to
+        # re-check later instead of abstaining. `detail` is added only when the model
+        # actually supplied non-blank supporting detail of its own.
+        payload: dict = {"fact_type": fact_type, "statement": statement, "evidence": evidence}
         if detail:
             payload["detail"] = detail
 

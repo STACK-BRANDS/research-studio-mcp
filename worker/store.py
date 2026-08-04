@@ -1055,9 +1055,17 @@ def create_finding(
     non-enabled connector — same legal-gate discipline as `create_voc_quote`/
     `create_site_capture`. `content_sha256` is computed server-side from `p_raw_content`.
 
-    For a `site_fact` finding, the caller (`worker.extract.run_collect`) passes the
-    page's own CANONICAL text as `raw_content` — a finding is a page fact, not customer
-    voice, so it is evidenced against the whole page, not the review-widget text.
+    For a `site_fact` finding, `payload` is `{fact_type, statement, evidence, detail?}` —
+    `evidence` is a REQUIRED, first-class verbatim excerpt of `raw_content` (the caller,
+    `worker.extract._mint_findings`, both requires it non-blank and normalized-substring
+    grounding-gates it against the canonical page text before ever calling this wrapper;
+    a companion DB-side gate re-runs the same verbatim-present check server-side), never
+    folded into `detail` — `detail` remains the model's OPTIONAL free-text elaboration.
+    Persisting `evidence` gives `worker.verify`'s finding branch an authoritative verbatim
+    span to re-check later, exactly like a VoC quote's `quote` text. The caller
+    (`worker.extract.run_collect`) passes the page's own CANONICAL text as `raw_content`
+    — a finding is a page fact, not customer voice, so it is evidenced against the whole
+    page, not the review-widget text.
 
     NOT best-effort: any RPC failure (unregistered kind/version, non-enabled connector,
     DB error) propagates unchanged; `run_collect`'s admission control is the one place
@@ -1412,8 +1420,10 @@ def rs_create_synthesis(
 
 def get_finding(finding_id: str) -> Optional[dict]:
     """Read one `research_findings` row by id -- `finding_kind`, `schema_version`,
-    `payload` (jsonb: `fact_type`/`statement`/`detail` for a `site_fact` v1 row),
-    `source_url`, `capture_id`, `confidence` -- everything `worker.verify.run_verify`
+    `payload` (jsonb: `fact_type`/`statement`/`evidence`/optional `detail` for a
+    `site_fact` v1 row -- `evidence` is the first-class, DB-gated verbatim excerpt
+    `worker.verify`'s finding branch re-checks against a freshly re-downloaded canonical
+    text), `source_url`, `capture_id`, `confidence` -- everything `worker.verify.run_verify`
     needs to re-check a 'finding' sample member's grounding against a freshly
     re-extracted, hash-authenticated canonical text, and to build the adversarial label
     pass's LABEL payload.
