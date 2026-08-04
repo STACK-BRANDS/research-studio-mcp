@@ -600,8 +600,17 @@ def run_collect(job: dict, claimant: str) -> dict:
     ref = f"collect:{capture_id}:{extractor_version}:{claimant}"
     reserved = budget.reserve(job, ref, claimant)
     if not reserved:
-        # 'skip' -- this exact ref was already reserved (a replay of an already-
-        # collected capture). Nothing to re-extract, nothing to re-mint.
+        # 'skip' -- this exact ref was already reserved. A skip is a REPLAY of THIS claim
+        # (per-claim ref: same claimant -> same ref), and the prior attempt may have
+        # reserved then CRASHED before it settled, leaving the reservation OPEN. Settle it
+        # at the ceiling before returning: `budget.settle`/`rs_settle_call` is idempotent
+        # server-side (a repeat settle for an already-settled ref is a no-op that keeps the
+        # original amount; a ref that was never settled is now closed at the conservative
+        # worst case), so this can NEVER double-count and NEVER orphans a crashed prior
+        # attempt's reservation. `reserved.reserved_est_cents` is populated on the 'skip'
+        # path too (same deterministic price lookup as 'ok'). Same reconciliation the verify
+        # worker's reserve-skip path uses.
+        _settle_with_retry(job, ref, reserved.reserved_est_cents, claimant, reserved.reserved_est_cents)
         return {
             "quotes_minted": 0,
             "quotes_rejected": 0,

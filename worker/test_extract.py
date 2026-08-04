@@ -623,6 +623,12 @@ def test_run_collect_reserve_skip_short_circuits_without_calling_anthropic(monke
     assert hooks["anthropic_calls"] == []
     assert fake_store.voc_quotes == []
     assert fake_store.findings == []
+    # The skip path RECONCILES the reservation (a crashed prior attempt may have left it
+    # open): exactly one settle, at the ceiling, report_usage=False -- never orphaned.
+    assert len(hooks["settle_calls"]) == 1
+    assert hooks["settle_calls"][0]["actual_cents"] == 25
+    assert hooks["settle_calls"][0]["reserved_est"] == 25
+    assert hooks["settle_calls"][0]["report_usage"] is False
 
 
 def test_run_collect_happy_path_mints_valid_quotes_and_findings(monkeypatch):
