@@ -79,6 +79,18 @@ logger = logging.getLogger(__name__)
 
 ADHOC_PROJECT = "adhoc"
 
+# `_dispatch`'s verify branch returns this sentinel `status` (NEVER the literal "done")
+# because `worker.store.rs_verify_finalize` (migration 150) already CASes `research_jobs.
+# status` to 'done' ATOMICALLY WITH the verification verdict, server-side -- the deployed
+# contract requires the one-live-index release to coincide with the verdict, so the RPC
+# itself commits the terminal transition rather than leaving it to this worker's own
+# finish_job CAS. `_run_claimed` recognises this sentinel and skips its own running->done
+# CAS entirely for that one dispatch: calling `finish_job` after the RPC already flipped
+# status away from 'running' would match ZERO rows and be misread as "the lease was
+# revoked mid-run" (P1-C) -- a successful verify job would then be reported as an
+# unpersisted outcome (`None`) instead of the successful completion it actually was.
+_STATUS_ALREADY_FINALIZED = "already_finalized"
+
 
 # ---------------------------------------------------------------------------
 # 1.1 -- deterministic idempotency-key builders
@@ -337,22 +349,29 @@ def _spawn_heartbeat(job_id: str, claimant: str, job_kind: Optional[str]) -> _He
 
 def _dispatch(job: dict, claimant: str) -> tuple:
     """Route one claimed+running job to its handler by (job_kind,
-    connector). Three real handlers exist as of Phase 3: (scrape,
+    connector). Four real handlers exist as of Phase 4: (scrape,
     ad_library.scrapecreators) -> `worker.run.handle_scrape` (Task 1.6, the
     ads-as-scrape reuse), (scrape, web.fetch) ->
     `worker.connectors.web_fetch.capture_pages` (Phase 2, the static-HTML
-    site-capture connector), and `collect` -> `worker.extract.run_collect`
+    site-capture connector), `collect` -> `worker.extract.run_collect`
     (Phase 3, the extraction job: one site capture -> VoC quotes + site-fact
-    findings). Every other (job_kind, connector) combination -- verify/
-    synthesize, and any scrape connector besides the two above -- has no
-    handler yet (Task P4): it is finished 'failed' with a clear,
-    machine-greppable error rather than raising or crashing the loop, so an
-    as-yet-unimplemented job_kind can already be queued (e.g. by a future
-    planner) without taking down a worker that doesn't know how to run it
-    yet.
+    findings), and `verify` -> `worker.verify.run_verify` (Phase 4, the
+    verification job: independently re-check a frozen sample of already-
+    minted evidence against a freshly re-downloaded, hash-authenticated
+    capture). Every other (job_kind, connector) combination -- synthesize,
+    and any scrape connector besides the two above -- has no handler yet
+    (Task P4): it is finished 'failed' with a clear, machine-greppable error
+    rather than raising or crashing the loop, so an as-yet-unimplemented
+    job_kind can already be queued (e.g. by a future planner) without taking
+    down a worker that doesn't know how to run it yet.
 
     Returns `(status, cost_cents, error)` -- `_run_claimed()` passes these
-    straight through to `finish_job`. The scrape/ads branch's `error` is
+    straight through to `finish_job`, with ONE exception: the `verify` branch
+    returns `_STATUS_ALREADY_FINALIZED` (never the literal "done") because
+    `rs_verify_finalize` already committed the terminal `research_jobs.status`
+    transition itself, server-side, atomically with the verdict -- see
+    `_STATUS_ALREADY_FINALIZED`'s own module-level docstring and
+    `_run_claimed`'s handling of it (P1-C). The scrape/ads branch's `error` is
     `handle_scrape`'s own (P2-2 fix: no longer discarded to None on a
     failure) -- passed through here unchanged, not re-derived. The
     scrape/web.fetch branch's `cost_cents` is always `0` (not None, and not
@@ -433,6 +452,29 @@ def _dispatch(job: dict, claimant: str) -> tuple:
         # handle_scrape computed, and never invents a second number here either).
         return "done", None, None
 
+    if job_kind == "verify":
+        from worker import verify  # noqa: PLC0415 -- deferred; see docstring above (worker.verify
+        # imports worker.jobs at module level, for jobs.assert_lease's lease fences -- the same
+        # ordering hazard the scrape/collect branches already document).
+        result = verify.run_verify(job, claimant)
+        logger.info(
+            "verify job %s: %d members frozen (supported=%d unsupported=%d abstained=%d "
+            "integrity_failed=%d unauthenticatable=%d) verdict=%s",
+            job.get("id"), result["members_frozen"],
+            result["supported"], result["unsupported"], result["abstained"],
+            result["integrity_failed"], result["unauthenticatable"], result["verdict"],
+        )
+        # cost_cents is None here, same "the ledger, not this job-spine column, is
+        # authoritative" convention the collect branch above documents -- verify's real
+        # spend already lives in rs_settle_call's own ledger rows, one per member's paid
+        # label pass.
+        #
+        # status is _STATUS_ALREADY_FINALIZED, NEVER the literal "done" (P1-C):
+        # `run_verify`'s own `rs_verify_finalize` call already CASed research_jobs.status
+        # to 'done' server-side, atomically with the verdict -- see that constant's
+        # module-level docstring and `_run_claimed`'s handling of it.
+        return _STATUS_ALREADY_FINALIZED, None, None
+
     return "failed", None, "handler not implemented (P2-P4)"
 
 
@@ -463,6 +505,19 @@ def _run_claimed(job: dict, claimant: str) -> Optional[str]:
     than propagating -- the same "one job's failure must fail only that
     job" discipline the "handler not implemented" branch already gets
     inside `_dispatch`.
+
+    ONE handler (verify) does not fit the "this function owns the terminal
+    CAS" model: `_dispatch`'s verify branch returns `_STATUS_ALREADY_FINALIZED`
+    (never "done") because `rs_verify_finalize` already committed research_jobs'
+    running->done transition itself, server-side, atomically with the verdict
+    (P1-C -- see that constant's docstring). Calling `finish_job` in that case
+    would CAS against `status='running'`, match ZERO rows (status is already
+    'done'), and be misread as "the lease was revoked mid-run" -- reporting a
+    SUCCESSFUL verify job as an unpersisted `None` outcome. This function
+    recognises the sentinel and skips its own CAS for that one case, reporting
+    the same successful "done" `finish_job` would have persisted. The
+    collect/scrape/synthesize paths are completely unaffected -- they always
+    return the literal "done"/"failed" and always go through the normal CAS.
     """
     job_id = job["id"]
     if not mark_running(job_id, claimant):
@@ -478,6 +533,13 @@ def _run_claimed(job: dict, claimant: str) -> Optional[str]:
         status, cost_cents, error = "failed", None, f"handler raised: {exc}"
     finally:
         hb.stop()
+
+    if status == _STATUS_ALREADY_FINALIZED:
+        # P1-C: the RPC already committed the terminal transition -- there is
+        # nothing left for finish_job's CAS to do (it would match 0 rows and be
+        # misread as a revoked lease). Report the SAME successful terminal
+        # status finish_job would have persisted, without calling it.
+        return "done"
 
     # finish_job's own CAS is the final word: if the lease was revoked after
     # dispatch but before here, it matches 0 rows and returns False -- the
