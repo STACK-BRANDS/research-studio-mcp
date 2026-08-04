@@ -170,6 +170,70 @@ PROPOSED_RESEARCH_SCHEMA = {
 }
 
 
+# ---------------------------------------------------------------------------
+# The `synthesize` job's structured-output schema (Research Studio P4 PRODUCER, deep-
+# research plan v2.0) -- a VoC pain-map deliverable. Unlike `build_analysis_schema`, this
+# has no live-registry dependency (no dynamic enum to fetch), so it is a plain function,
+# not a query-then-build pair -- `worker.synthesize` calls it directly, and prices its
+# own `json.dumps(...)` length once at import time for its worst-case cost reservation
+# (see `worker.synthesize._SCHEMA_CHARS`).
+# ---------------------------------------------------------------------------
+
+# The two `research_publishable_evidence` kinds a synthesis's `evidence_refs` may cite --
+# mirrors `worker.verify.EVIDENCE_KIND_VOC`/`EVIDENCE_KIND_FINDING`, duplicated here (not
+# imported) per this worker's own established per-call-site-duplication convention.
+SYNTHESIS_EVIDENCE_KINDS = ["voc", "finding"]
+
+
+def _build_synthesis_evidence_ref_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "enum": SYNTHESIS_EVIDENCE_KINDS},
+            "id": {"type": "string"},
+        },
+        "required": ["kind", "id"],
+    }
+
+
+def _build_synthesis_pain_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "theme": {"type": "string"},
+            "summary": {"type": "string"},
+            # Every pain MUST carry at least the ids it is actually grounded in --
+            # `worker.synthesize.run_synthesize` is the layer that VALIDATES each
+            # {kind, id} pair against the real `research_publishable_evidence` set (this
+            # schema only shapes/types the response; it cannot itself prove an id is
+            # real, so it is not a substitute for that worker-side honesty check).
+            "evidence_refs": {"type": "array", "items": _build_synthesis_evidence_ref_schema()},
+        },
+        "required": ["theme", "summary", "evidence_refs"],
+    }
+
+
+def build_synthesis_schema() -> dict:
+    """Strict Anthropic structured-output schema for the `synthesize` job's VoC pain-map
+    deliverable: a `title` plus a small set of `pains`, each a `theme`/`summary` grounded
+    in `evidence_refs` -- `{kind, id}` pairs the model must draw from the publishable
+    evidence it was shown (`worker.synthesize._build_synthesis_prompt`). Every object --
+    including nested ones -- sets `additionalProperties: false` and lists every key it
+    defines in `required`, matching this module's `build_analysis_schema()` convention.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "pains": {"type": "array", "items": _build_synthesis_pain_schema()},
+        },
+        "required": ["title", "pains"],
+    }
+
+
 def build_analysis_schema(angle_keys: list[str] | None = None) -> dict:
     """Build the analysis output schema. `angle_keys` constrains each per-ad
     row's `angle_key` enum; when omitted, queries the live registry (with

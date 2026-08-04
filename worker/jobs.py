@@ -349,21 +349,25 @@ def _spawn_heartbeat(job_id: str, claimant: str, job_kind: Optional[str]) -> _He
 
 def _dispatch(job: dict, claimant: str) -> tuple:
     """Route one claimed+running job to its handler by (job_kind,
-    connector). Four real handlers exist as of Phase 4: (scrape,
+    connector). Five real handlers exist as of the synthesize build: (scrape,
     ad_library.scrapecreators) -> `worker.run.handle_scrape` (Task 1.6, the
     ads-as-scrape reuse), (scrape, web.fetch) ->
     `worker.connectors.web_fetch.capture_pages` (Phase 2, the static-HTML
     site-capture connector), `collect` -> `worker.extract.run_collect`
     (Phase 3, the extraction job: one site capture -> VoC quotes + site-fact
-    findings), and `verify` -> `worker.verify.run_verify` (Phase 4, the
+    findings), `verify` -> `worker.verify.run_verify` (Phase 4, the
     verification job: independently re-check a frozen sample of already-
     minted evidence against a freshly re-downloaded, hash-authenticated
-    capture). Every other (job_kind, connector) combination -- synthesize,
-    and any scrape connector besides the two above -- has no handler yet
-    (Task P4): it is finished 'failed' with a clear, machine-greppable error
-    rather than raising or crashing the loop, so an as-yet-unimplemented
-    job_kind can already be queued (e.g. by a future planner) without taking
-    down a worker that doesn't know how to run it yet.
+    capture), and `synthesize` -> `worker.synthesize.run_synthesize` (the P4
+    PRODUCER job: turn verified, currently-publishable evidence into a
+    DRAFT, evidence-linked VoC pain-map synthesis -- the worker never
+    publishes; that stays the L3 human's `rs_publish_synthesis` action, this
+    module never calls it). Every other (job_kind, connector) combination --
+    any scrape connector besides the two above -- has no handler yet: it is
+    finished 'failed' with a clear, machine-greppable error rather than
+    raising or crashing the loop, so an as-yet-unimplemented job_kind/
+    connector can already be queued (e.g. by a future planner) without
+    taking down a worker that doesn't know how to run it yet.
 
     Returns `(status, cost_cents, error)` -- `_run_claimed()` passes these
     straight through to `finish_job`, with ONE exception: the `verify` branch
@@ -382,17 +386,24 @@ def _dispatch(job: dict, claimant: str) -> tuple:
     an estimate. This is also why this branch never calls
     `worker.budget.reserve()`/`settle()`: those guard a PAID call's
     worst-case ceiling against a project's ledger, and there is no such call
-    here to guard.
+    here to guard. The `synthesize` branch's `(status, cost_cents, error)` is
+    `run_synthesize`'s own -- unlike collect/verify (whose own return shape
+    isn't a status tuple, so this function derives one itself and reports
+    `cost_cents=None`, deferring to the ledger as authoritative),
+    `run_synthesize` already returns the real settled `actual_cents` and a
+    greppable error directly, so this branch passes it through unchanged
+    rather than re-deriving or discarding it.
 
-    `worker.run` and `worker.connectors.web_fetch` are both imported HERE,
-    inside the function, rather than at module level, specifically to avoid
-    a circular import: `worker.run` imports `worker.jobs` at module level
-    (for `enqueue`/`drain`/`make_claimant` in its CLI `main()`), and
-    `worker.connectors.web_fetch` imports `worker.jobs` at module level too
-    (for `jobs.assert_lease`'s per-page lease fence) -- this module
-    dispatches back into both, so a module-level import on THIS side as
-    well would make load order matter (whichever is imported first would
-    see the other only partially initialized). Deferring both imports to
+    `worker.run`, `worker.connectors.web_fetch`, and `worker.synthesize` are
+    all imported HERE, inside the function, rather than at module level,
+    specifically to avoid a circular import: `worker.run` imports
+    `worker.jobs` at module level (for `enqueue`/`drain`/`make_claimant` in
+    its CLI `main()`), and `worker.connectors.web_fetch`/`worker.synthesize`
+    both import `worker.jobs` at module level too (for
+    `jobs.assert_lease`'s lease fences) -- this module dispatches back into
+    all three, so a module-level import on THIS side as well would make
+    load order matter (whichever is imported first would see the others
+    only partially initialized). Deferring every one of these imports to
     call time sidesteps the ordering question entirely: by the time
     `drain()` actually dispatches a job, every module has long finished
     importing.
@@ -474,6 +485,17 @@ def _dispatch(job: dict, claimant: str) -> tuple:
         # to 'done' server-side, atomically with the verdict -- see that constant's
         # module-level docstring and `_run_claimed`'s handling of it.
         return _STATUS_ALREADY_FINALIZED, None, None
+
+    if job_kind == "synthesize":
+        from worker import synthesize  # noqa: PLC0415 -- deferred; see docstring above (worker.
+        # synthesize imports worker.jobs at module level, for jobs.assert_lease's lease fences --
+        # the same ordering hazard the collect/verify branches already document).
+        status, cost_cents, error = synthesize.run_synthesize(job, claimant)
+        logger.info(
+            "synthesize job %s: status=%s cost_cents=%s%s",
+            job.get("id"), status, cost_cents, f" error={error}" if error else "",
+        )
+        return status, cost_cents, error
 
     return "failed", None, "handler not implemented (P2-P4)"
 

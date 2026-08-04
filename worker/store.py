@@ -1302,6 +1302,114 @@ def get_voc_quote(quote_id: str) -> Optional[dict]:
     return res.data[0]
 
 
+# ---------------------------------------------------------------------------
+# P4 PRODUCTION (the `synthesize` job) -- read back the currently-publishable evidence
+# for a store and mint a DRAFT, evidence-linked synthesis through the deployed
+# `rs_create_synthesis` RPC (migration 157). Same job-spine banner as P3 EXTRACTION /
+# P4 VERIFICATION above: neither wrapper below is best-effort. `worker.synthesize.
+# run_synthesize` depends on an honest read to know what it may cite, and an honest RPC
+# result to know whether the synthesis it built was actually minted -- silently
+# swallowing either could either cite/publish evidence nobody confirmed is publishable,
+# or hide a real infrastructure failure behind a false "nothing to synthesize".
+# ---------------------------------------------------------------------------
+
+def get_publishable_evidence(store_id: str, limit: Optional[int] = None) -> list:
+    """Read `research_publishable_evidence` (migration 150 VIEW) rows for `store_id` --
+    `evidence_id, evidence_kind, summary` -- the ONLY source of citable evidence a
+    `synthesize` job may draw from. The view carries no `project_id`/`area` column at
+    all (confirmed against the deployed schema), so `store_id` is the only scope it
+    supports -- there is nothing finer to filter on here; a caller wanting a narrower
+    slice has no query-side way to get one.
+
+    `limit` bounds how many rows come back (server-side, via `.limit()`) -- `worker.
+    synthesize.run_synthesize` uses this to keep its prompt (and therefore its
+    worst-case cost reservation) bounded regardless of how much publishable evidence a
+    store has accumulated. `None` (the default) applies no limit, matching every other
+    optional-param convention in this module.
+
+    Returns a plain list -- possibly EMPTY, which is a legitimate outcome (nothing
+    publishable yet for this store): `run_synthesize` refuses to synthesize from an
+    empty set rather than treating this as a read failure, and never invents a
+    synthesis to cover for it.
+
+    NOT best-effort (see the job-spine banner above this section): any read failure
+    (network, auth, DB error) propagates unchanged -- a caller that silently treated a
+    failed read as "no evidence" could wrongly refuse a synthesize job that should have
+    succeeded, or (worse) proceed on a citation set nobody actually confirmed is real.
+    """
+    sb = _client()
+    query = (
+        sb.table("research_publishable_evidence")
+        .select("evidence_id, evidence_kind, summary")
+        .eq("store_id", store_id)
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    res = query.execute()
+    return res.data or []
+
+
+def rs_create_synthesis(
+    store_id: str,
+    kind: str,
+    schema_version: int,
+    title: str,
+    payload: dict,
+    evidence_refs: list,
+    confidence: str,
+    area: Optional[str] = None,
+    project_id: Optional[str] = None,
+    origin: str = "agent",
+    thin_data: bool = False,
+    created_by: Optional[str] = None,
+) -> str:
+    """Call the deployed `rs_create_synthesis` RPC (migration 157): mints one
+    `research_syntheses` row and returns its id.
+
+    The RPC RE-CHECKS every `evidence_refs` entry server-side against non-refuted,
+    currently-publishable evidence and FORCES `status='draft'` regardless of what is
+    passed here -- this worker NEVER publishes; `rs_publish_synthesis` is a separate,
+    human (L3) action this module never calls, directly or indirectly.
+
+    `p_evidence_refs` is a jsonb array of `{"table": <'research_voc_quotes'|
+    'research_findings'>, "id": <evidence_id>}` -- the DISTINCT set of evidence the
+    caller (`worker.synthesize.run_synthesize`) actually validated and cited, built
+    from `get_publishable_evidence`'s own returned rows, never invented here.
+
+    NOT best-effort (see the job-spine banner above this section): any RPC failure (a
+    ref that went refuted/non-publishable between the caller's read and this call, a
+    malformed payload, a DB error) propagates unchanged -- `run_synthesize` is the one
+    place that decides what a rejection means (a `("failed", ...)` return, spend already
+    settled), this wrapper never swallows it.
+
+    Optional params (`area`/`project_id`/`created_by`) are omitted from the RPC payload
+    entirely when None, matching every other RPC wrapper's convention in this module.
+    `origin`/`thin_data` are always sent -- they carry real, meaningful defaults rather
+    than "omit when absent" semantics (the RPC has no sensible default for either that
+    this wrapper should silently defer to).
+    """
+    sb = _client()
+    params: dict = {
+        "p_store_id": store_id,
+        "p_kind": kind,
+        "p_schema_version": schema_version,
+        "p_title": title,
+        "p_payload": payload,
+        "p_evidence_refs": evidence_refs,
+        "p_confidence": confidence,
+        "p_origin": origin,
+        "p_thin_data": thin_data,
+    }
+    if area is not None:
+        params["p_area"] = area
+    if project_id is not None:
+        params["p_project_id"] = project_id
+    if created_by is not None:
+        params["p_created_by"] = created_by
+    res = sb.rpc("rs_create_synthesis", params).execute()
+    return res.data
+
+
 def get_finding(finding_id: str) -> Optional[dict]:
     """Read one `research_findings` row by id -- `finding_kind`, `schema_version`,
     `payload` (jsonb: `fact_type`/`statement`/`detail` for a `site_fact` v1 row),
