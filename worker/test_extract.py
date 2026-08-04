@@ -154,7 +154,7 @@ def test_create_voc_quote_sends_expected_params_with_all_fields(monkeypatch):
         quote="so comfy", source_url="https://x.com/p", raw_content="review text so comfy",
         connector="web.fetch", competitor_id="comp-1", store_id="mv", quote_type="desire",
         theme="comfort", product_area="bras", confidence="high",
-        source_start=10, source_end=18,
+        source_start=10, source_end=18, capture_id="cap-1",
     )
     assert quote_id == "quote-id-1"
     assert client.rpcs[0].name == "rs_create_voc_quote"
@@ -163,11 +163,14 @@ def test_create_voc_quote_sends_expected_params_with_all_fields(monkeypatch):
         "p_raw_content": "review text so comfy", "p_connector": "web.fetch",
         "p_competitor_id": "comp-1", "p_store_id": "mv", "p_type": "desire",
         "p_theme": "comfort", "p_product_area": "bras", "p_confidence": "high",
-        "p_source_start": 10, "p_source_end": 18,
+        "p_source_start": 10, "p_source_end": 18, "p_capture_id": "cap-1",
     }
 
 
 def test_create_voc_quote_omits_optional_params_when_none(monkeypatch):
+    """`capture_id` is the one deliberate exception (migration 149): `p_capture_id` is
+    ALWAYS sent, even as `None` -> SQL NULL, unlike every other optional param here
+    (see `create_voc_quote`'s docstring)."""
     client = _FakeRpcClient(rpc_response="quote-id-2")
     monkeypatch.setattr(store, "_client", lambda: client)
     store.create_voc_quote(
@@ -177,6 +180,7 @@ def test_create_voc_quote_omits_optional_params_when_none(monkeypatch):
     assert client.rpcs[0].params == {
         "p_quote": "ok", "p_source_url": "https://x.com/p",
         "p_raw_content": "ok text", "p_connector": "web.fetch",
+        "p_capture_id": None,
     }
 
 
@@ -198,7 +202,7 @@ def test_create_finding_sends_expected_params_with_all_fields(monkeypatch):
         finding_kind="site_fact", schema_version=1,
         payload={"fact_type": "pricing", "statement": "Buy 2 get 1 free"},
         source_url="https://x.com/p", raw_content="page text", connector="web.fetch",
-        project_id="proj-1", store_id="mv", confidence="medium",
+        project_id="proj-1", store_id="mv", confidence="medium", capture_id="cap-1",
     )
     assert finding_id == "finding-id-1"
     assert client.rpcs[0].name == "rs_create_finding"
@@ -207,11 +211,14 @@ def test_create_finding_sends_expected_params_with_all_fields(monkeypatch):
         "p_payload": {"fact_type": "pricing", "statement": "Buy 2 get 1 free"},
         "p_source_url": "https://x.com/p", "p_raw_content": "page text",
         "p_connector": "web.fetch", "p_project_id": "proj-1",
-        "p_store_id": "mv", "p_confidence": "medium",
+        "p_store_id": "mv", "p_confidence": "medium", "p_capture_id": "cap-1",
     }
 
 
 def test_create_finding_omits_optional_params_when_none(monkeypatch):
+    """`capture_id` is the one deliberate exception (migration 149): `p_capture_id` is
+    ALWAYS sent, even as `None` -> SQL NULL, unlike every other optional param here
+    (see `create_finding`'s docstring)."""
     client = _FakeRpcClient(rpc_response="finding-id-2")
     monkeypatch.setattr(store, "_client", lambda: client)
     store.create_finding(
@@ -222,6 +229,7 @@ def test_create_finding_omits_optional_params_when_none(monkeypatch):
         "p_finding_kind": "site_fact", "p_schema_version": 1,
         "p_payload": {"fact_type": "policy", "statement": "s"},
         "p_source_url": "u", "p_raw_content": "c", "p_connector": "web.fetch",
+        "p_capture_id": None,
     }
 
 
@@ -335,7 +343,7 @@ class _FakeStore:
     def create_voc_quote(self, quote, source_url, raw_content, connector,
                           competitor_id=None, store_id=None, quote_type=None,
                           theme=None, product_area=None, confidence=None,
-                          source_start=None, source_end=None):
+                          source_start=None, source_end=None, capture_id=None):
         if quote in self.raise_on_quote:
             raise RuntimeError(f"rs_create_voc_quote: p_quote is not verbatim-present ({quote!r})")
         if quote in self.infra_raise_on_quote:
@@ -345,18 +353,20 @@ class _FakeStore:
             "connector": connector, "competitor_id": competitor_id, "store_id": store_id,
             "type": quote_type, "theme": theme, "product_area": product_area,
             "confidence": confidence, "source_start": source_start, "source_end": source_end,
+            "capture_id": capture_id,
         }
         self.voc_quotes.append(row)
         return f"quote-{len(self.voc_quotes)}"
 
     def create_finding(self, finding_kind, schema_version, payload, source_url, raw_content,
-                        connector, project_id=None, store_id=None, confidence=None):
+                        connector, project_id=None, store_id=None, confidence=None, capture_id=None):
         if payload.get("statement") in self.infra_raise_on_finding:
             raise RuntimeError("connection reset by peer")
         row = {
             "finding_kind": finding_kind, "schema_version": schema_version, "payload": payload,
             "source_url": source_url, "raw_content": raw_content, "connector": connector,
             "project_id": project_id, "store_id": store_id, "confidence": confidence,
+            "capture_id": capture_id,
         }
         self.findings.append(row)
         return f"finding-{len(self.findings)}"
@@ -660,6 +670,10 @@ def test_run_collect_happy_path_mints_valid_quotes_and_findings(monkeypatch):
     # An exact literal match exists, so a source span was attached.
     assert minted_quote["source_start"] is not None
     assert minted_quote["source_end"] is not None
+    # Provenance (migration 149): the job's own capture_id is threaded through to the
+    # mint call unchanged, so the minted quote records its occurrence against the
+    # capture it was extracted from.
+    assert minted_quote["capture_id"] == "cap-1"
 
     # The one minted finding was evidenced against the CANONICAL (whole-page) text. Its
     # `detail` was blank, so the verbatim `evidence` was folded into `detail`; `evidence`
@@ -672,6 +686,8 @@ def test_run_collect_happy_path_mints_valid_quotes_and_findings(monkeypatch):
     assert minted_finding["raw_content"] == CANONICAL_TEXT
     assert minted_finding["project_id"] == "proj-1"
     assert minted_finding["store_id"] == "mv"
+    # Provenance (migration 149): same capture_id threading as the quote above.
+    assert minted_finding["capture_id"] == "cap-1"
 
     # budget.settle called with report_usage=False (the Anthropic call already reported
     # its own real token counts via usage_reporter.spend -- never double-counted).

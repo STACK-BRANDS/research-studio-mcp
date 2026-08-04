@@ -209,11 +209,16 @@ def capture_pages(job: dict, claimant: str, plan: list) -> dict:
           guarantees a capture row's `captured_html_path` always points at
           ITS OWN raw bytes, never an earlier, different page's. ONLY THEN
           `store.create_site_capture(..., captured_html_path=<the html
-          object's path>)` -- the deployed RPC itself REQUIRES
-          `p_captured_html_path` and raises if it's null/blank, so a
-          capture row must never be mintable before its bytes are durably
-          stored; this ordering is what makes that guarantee true in this
-          connector's own code, not just in the DB constraint.
+          object's path>, raw_html_sha256=raw_sha256)` -- the deployed RPC
+          itself REQUIRES `p_captured_html_path` and raises if it's
+          null/blank, so a capture row must never be mintable before its
+          bytes are durably stored; this ordering is what makes that
+          guarantee true in this connector's own code, not just in the DB
+          constraint. `raw_html_sha256` reuses the SAME `raw_sha256` already
+          computed in step 7 to key the storage path above -- never
+          recomputed -- so the capture row's provenance hash is guaranteed
+          to match the bytes actually stored at `captured_html_path`
+          (migration 149).
 
     Returns `{"captured": int, "unchanged": int, "robots_skipped": int,
     "errors": list[dict]}`. `errors` entries are `{"url", "reason"}` (plus
@@ -364,6 +369,7 @@ def capture_pages(job: dict, claimant: str, plan: list) -> dict:
                     connector=connector,
                     competitor_id=competitor_id,
                     captured_html_path=html_path,
+                    raw_html_sha256=raw_sha256,
                 )
                 result["captured"] += 1
                 logger.info(
