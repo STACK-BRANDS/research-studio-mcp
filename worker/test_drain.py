@@ -494,17 +494,19 @@ def test_dispatch_routes_collect_to_run_collect(monkeypatch):
 
 
 def test_dispatch_unimplemented_job_kind_fails_cleanly():
-    """`collect` is now a real handler (Phase 3) -- use `synthesize`, still genuinely
-    unimplemented (Task P4), so this test still proves what it claims to."""
-    job = {"id": "job-1", "job_kind": "synthesize", "params": {}}
+    """`collect`/`verify`/`synthesize` are now all real handlers -- use a scrape
+    connector besides the two implemented ones (`ad_library.scrapecreators`/
+    `web.fetch`), still genuinely unimplemented, so this test still proves what it
+    claims to (see `_dispatch`'s own docstring)."""
+    job = {"id": "job-1", "job_kind": "scrape", "params": {"connector": "some_future_connector"}}
     result = jobs._dispatch(job, "claimant-1")
     assert result == ("failed", None, "handler not implemented (P2-P4)")
 
 
 def test_dispatch_handles_missing_params():
-    """`verify` is now a real handler too (Phase 4) -- use `synthesize`, still genuinely
-    unimplemented (Task P4), so this test still proves what it claims to."""
-    job = {"id": "job-1", "job_kind": "synthesize", "params": None}
+    """`collect`/`verify`/`synthesize` are now all real handlers -- a job row with
+    `params=None` and an unimplemented scrape connector must not crash `_dispatch`."""
+    job = {"id": "job-1", "job_kind": "scrape", "params": None}
     result = jobs._dispatch(job, "claimant-1")
     assert result == ("failed", None, "handler not implemented (P2-P4)")
 
