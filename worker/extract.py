@@ -382,6 +382,7 @@ def _settle_with_retry(
 
 def _mint_quotes(
     job_id, claimant: str, quotes: list, review_text: str, source_url: str, competitor_id, store_id,
+    capture_id=None,
 ) -> tuple:
     """Admission-control + mint every candidate quote. Returns (minted, rejected).
 
@@ -389,7 +390,12 @@ def _mint_quotes(
     `store.create_voc_quote` call (not once for the whole loop): if the lease is lost
     mid-loop, this raises immediately -- no further quote is minted -- because a revoked
     worker must stop issuing evidence writes the instant a new claimant may already be
-    minting its own (FIX 6)."""
+    minting its own (FIX 6).
+
+    `capture_id` (migration 149 provenance) is threaded straight from `run_collect`'s
+    job params through to every `store.create_voc_quote` call unchanged -- every quote
+    minted by this collect job records its occurrence against the exact capture it was
+    extracted from."""
     minted = 0
     rejected = 0
     normalized_review = normalize_text(review_text)
@@ -435,6 +441,7 @@ def _mint_quotes(
                 confidence=candidate.get("confidence"),
                 source_start=span[0] if span else None,
                 source_end=span[1] if span else None,
+                capture_id=capture_id,
             )
             minted += 1
         except Exception as exc:  # noqa: BLE001 -- the RPC is the real backstop (A-1):
@@ -454,6 +461,7 @@ def _mint_quotes(
 
 def _mint_findings(
     job_id, claimant: str, findings: list, canonical_text_: str, source_url: str, project_id, store_id,
+    capture_id=None,
 ) -> tuple:
     """Admission-control + mint every candidate finding. Returns (minted, rejected).
 
@@ -468,7 +476,11 @@ def _mint_findings(
     is otherwise blank, or simply discarded once the gate has used it.
 
     `jobs.assert_lease(job_id, claimant)` is checked immediately before EACH
-    `store.create_finding` call, same discipline as `_mint_quotes` (FIX 6)."""
+    `store.create_finding` call, same discipline as `_mint_quotes` (FIX 6).
+
+    `capture_id` (migration 149 provenance) is threaded straight from `run_collect`'s
+    job params through to every `store.create_finding` call unchanged, same discipline
+    as `_mint_quotes`."""
     minted = 0
     rejected = 0
     normalized_canonical = normalize_text(canonical_text_)
@@ -523,6 +535,7 @@ def _mint_findings(
                 project_id=project_id,
                 store_id=store_id,
                 confidence=candidate.get("confidence"),
+                capture_id=capture_id,
             )
             minted += 1
         except Exception as exc:  # noqa: BLE001 -- same drop-not-crash discipline as
@@ -672,9 +685,11 @@ def run_collect(job: dict, claimant: str) -> dict:
     # (settled above) regardless of how far minting gets.
     quotes_minted, quotes_rejected = _mint_quotes(
         job_id, claimant, extraction.get("quotes"), review_text, source_url, competitor_id, store_id,
+        capture_id=capture_id,
     )
     findings_minted, findings_rejected = _mint_findings(
         job_id, claimant, extraction.get("findings"), canonical_text_, source_url, project_id, store_id,
+        capture_id=capture_id,
     )
 
     return {

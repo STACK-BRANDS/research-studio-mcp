@@ -715,9 +715,11 @@ def create_site_capture(
     competitor_id: Optional[str] = None,
     confidence: Optional[str] = None,
     captured_html_path: Optional[str] = None,
+    raw_html_sha256: Optional[str] = None,
 ) -> str:
-    """Call the deployed `rs_create_site_capture` RPC (migrations 142-144):
-    mints one `research_site_captures` row and returns its id.
+    """Call the deployed `rs_create_site_capture` RPC (migrations 142-144,
+    provenance param added by migration 149): mints one
+    `research_site_captures` row and returns its id.
 
     `p_captured_html_path` is REQUIRED by the RPC itself (it raises if
     null/blank) — the fetched bytes must already be durably stored
@@ -733,15 +735,22 @@ def create_site_capture(
     wrapper (Phase 2 ships the code; enabling the connector is a separate,
     later, human action).
 
+    `raw_html_sha256` (migration 149) is the sha256 hex of the RAW HTML bytes
+    (the same hash the caller already used to key the captured-html object's
+    storage path, e.g. `worker.connectors.web_fetch.capture_pages`'s
+    `raw_sha256`) — recorded on the capture row itself so downstream
+    evidence↔capture provenance can be verified against the exact bytes
+    captured, not just the canonical text `content_sha256` already covers.
+
     NOT best-effort (see the job-spine banner above this section): any RPC
     failure (missing captured_html_path, connector not enabled, DB error)
     propagates unchanged — a caller that silently swallowed this could
     believe a capture was minted when it was not.
 
-    Optional params (`competitor_id`/`confidence`/`captured_html_path`) are
-    omitted from the RPC payload entirely when None, matching every other
-    RPC wrapper's convention in this module (`rs_reserve_spend`,
-    `rs_settle_call`).
+    Optional params (`competitor_id`/`confidence`/`captured_html_path`/
+    `raw_html_sha256`) are omitted from the RPC payload entirely when None,
+    matching every other RPC wrapper's convention in this module
+    (`rs_reserve_spend`, `rs_settle_call`).
     """
     sb = _client()
     params: dict = {
@@ -756,6 +765,8 @@ def create_site_capture(
         params["p_confidence"] = confidence
     if captured_html_path is not None:
         params["p_captured_html_path"] = captured_html_path
+    if raw_html_sha256 is not None:
+        params["p_raw_html_sha256"] = raw_html_sha256
     res = sb.rpc("rs_create_site_capture", params).execute()
     return res.data
 
@@ -963,10 +974,12 @@ def create_voc_quote(
     confidence: Optional[str] = None,
     source_start: Optional[int] = None,
     source_end: Optional[int] = None,
+    capture_id: Optional[str] = None,
 ) -> str:
     """Call the deployed `rs_create_voc_quote` RPC (migration 142, the 12-arg overload
-    with the A-1 verbatim check + source-span params): mints one `research_voc_quotes`
-    row and returns its id.
+    with the A-1 verbatim check + source-span params; migration 149 added the trailing
+    `p_capture_id` provenance param): mints one `research_voc_quotes` row and returns
+    its id.
 
     `p_raw_content` is the evidence the RPC's own A-1 verbatim check runs against — the
     quote must be a NORMALIZED substring of exactly this text (or, when a source span is
@@ -985,7 +998,12 @@ def create_voc_quote(
     or a caller could mistake a rejected mint for a successful one.
 
     Optional params are omitted from the RPC payload entirely when None, matching every
-    other RPC wrapper's convention in this module.
+    other RPC wrapper's convention in this module -- EXCEPT `capture_id`: `p_capture_id`
+    is always sent, including as an explicit `None` (-> SQL NULL). The RPC defaults
+    `p_capture_id` to null and treats a null the same as an omitted arg (no occurrence
+    row recorded), so this is behaviorally identical to omitting it when unset, but
+    always sending it keeps the mint call's provenance intent explicit at every call
+    site rather than relying on omission to mean "no capture".
     """
     sb = _client()
     params: dict = {
@@ -1010,6 +1028,7 @@ def create_voc_quote(
         params["p_source_start"] = source_start
     if source_end is not None:
         params["p_source_end"] = source_end
+    params["p_capture_id"] = capture_id
     res = sb.rpc("rs_create_voc_quote", params).execute()
     return res.data
 
@@ -1024,10 +1043,12 @@ def create_finding(
     project_id: Optional[str] = None,
     store_id: Optional[str] = None,
     confidence: Optional[str] = None,
+    capture_id: Optional[str] = None,
 ) -> str:
     """Call the deployed `rs_create_finding` RPC (migration 033, registry-gated by
-    migration 146's `('site_fact', 1)` seed): mints one `research_findings` row and
-    returns its id.
+    migration 146's `('site_fact', 1)` seed; migration 149 added the trailing
+    `p_capture_id` provenance param): mints one `research_findings` row and returns
+    its id.
 
     Refuses any `(finding_kind, schema_version)` not already present in
     `research_finding_kinds` (defense in depth ahead of the table's own FK) and any
@@ -1043,7 +1064,8 @@ def create_finding(
     that catches this and counts it as a drop.
 
     Optional params are omitted from the RPC payload entirely when None, matching every
-    other RPC wrapper's convention in this module.
+    other RPC wrapper's convention in this module -- EXCEPT `capture_id`, always sent as
+    `p_capture_id` (including `None` -> SQL NULL), same rationale as `create_voc_quote`.
     """
     sb = _client()
     params: dict = {
@@ -1060,5 +1082,6 @@ def create_finding(
         params["p_store_id"] = store_id
     if confidence is not None:
         params["p_confidence"] = confidence
+    params["p_capture_id"] = capture_id
     res = sb.rpc("rs_create_finding", params).execute()
     return res.data

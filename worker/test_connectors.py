@@ -332,7 +332,8 @@ class _FakeStore:
         return path not in self._upload_exists_at
 
     def create_site_capture(self, url, source_url, raw_content, connector,
-                             competitor_id=None, confidence=None, captured_html_path=None):
+                             competitor_id=None, confidence=None, captured_html_path=None,
+                             raw_html_sha256=None):
         if url in self._raise_on_url:
             raise self._raise_on_url[url]
         self.calls.append(("create_site_capture", url))
@@ -340,6 +341,7 @@ class _FakeStore:
             "url": url, "source_url": source_url, "raw_content": raw_content,
             "connector": connector, "competitor_id": competitor_id,
             "confidence": confidence, "captured_html_path": captured_html_path,
+            "raw_html_sha256": raw_html_sha256,
         }
         self.captures.append(capture)
         return f"capture-{len(self.captures)}"
@@ -457,6 +459,10 @@ def test_capture_pages_storage_first_ordering_and_correct_paths(monkeypatch):
     assert capture["raw_content"] == text
     assert capture["captured_html_path"] == html_path
     assert capture["connector"] == "web.fetch"
+    # Provenance (migration 149): raw_html_sha256 is the SAME raw_sha256 already used to
+    # key captured_html_path above -- reused, never recomputed -- so the capture row's
+    # provenance hash is guaranteed to match the bytes actually stored there.
+    assert capture["raw_html_sha256"] == raw_sha
     assert capture["competitor_id"] == "comp-1"
 
 
