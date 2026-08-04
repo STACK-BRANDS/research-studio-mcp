@@ -70,15 +70,18 @@ before every spend/mint, settle worst-case on a failed paid call, never a false
      anti-fabrication finding: `result='unsupported'`, no paid call.
 
      A 'finding' member is checked against the freshly authenticated canonical text using
-     its stored `detail` field -- but `detail` is ONLY a reliable verbatim excerpt when it
-     was the model's original `evidence` snippet folded in at mint time because `detail`
-     was otherwise blank (see `worker.extract._mint_findings`); when `detail` was the
-     model's own non-verbatim free text, there is nothing authoritative left to re-ground
-     against at all -- the registered `site_fact` v1 payload never persists the original
-     verbatim `evidence` snippet. A finding whose `detail` does not verify verbatim
-     therefore records `result='abstained'` (NOT 'unsupported' -- "cannot verify" is
-     abstain, never refute; a Sol P1 finding), with a comment marking this a KNOWN GAP
-     pending a collect-side schema change to persist findings' real verbatim evidence.
+     its stored `payload.evidence` field -- the model's original verbatim excerpt, now
+     persisted FIRST-CLASS at mint time (see `worker.extract._mint_findings`) and gated
+     verbatim-present against the page at mint, exactly like a VoC quote. A finding whose
+     `evidence` fails a FRESH verbatim re-check therefore records `result='unsupported'`
+     (a genuine anti-fabrication finding, same as the quote path) -- the KNOWN GAP that
+     used to force `result='abstained'` for every finding is now CLOSED for every
+     evidence-bearing one. Only the legacy/malformed case -- `evidence` absent, not a
+     string, or blank (0 such rows exist post-migration; kept robust regardless) -- falls
+     back to the OLD `detail`-based check, and only THAT path still records
+     `result='abstained'` on a failed re-check ("cannot verify" is abstain, never refute;
+     a Sol P1 finding). Absence of `evidence` is never itself reinterpreted as a
+     refutation.
 
      A verbatim/grounding PASS proceeds to the ADVERSARIAL LABEL PASS (`_label_pass`): one
      budget-gated Anthropic call, structured-output-constrained to a 3-way
@@ -751,32 +754,43 @@ def _check_member(
             return RESULT_ABSTAINED, {"reason": "evidence_row_missing", "evidence_kind": evidence_kind}
 
         payload = finding_row.get("payload") or {}
-        # `detail` is the only field a `site_fact` row still carries that can be
-        # re-grounded: `worker.extract._mint_findings` folds the model's original
-        # verbatim `evidence` snippet into `detail` whenever `detail` was otherwise
-        # blank at mint time (the registered `site_fact` v1 payload has no separate
-        # `evidence` field at all -- it exists only transiently in run_collect's own
-        # admission control).
-        detail_text = (payload.get("detail") or "").strip()
-        if not _verbatim_ok(detail_text, canonical_text_ or ""):
-            # KNOWN GAP (P1-2, Sol): when `detail` was NOT blank at mint time, it is the
-            # model's own non-verbatim free-text elaboration, not a verbatim page excerpt
-            # -- the registered `site_fact` v1 payload never persists the original
-            # verbatim `evidence` snippet at all, so THIS finding's real evidence is not
-            # recoverable here. A failed check in that case proves nothing about whether
-            # the finding is actually wrong -- it only proves this module has nothing
+        # `evidence` is the model's persisted verbatim span (worker.extract._mint_findings,
+        # DB-gated verbatim-present at mint time by a companion migration) -- the SAME kind
+        # of authoritative re-groundable text the quote path already has. Only trust it
+        # when it is actually a non-blank string; anything else (missing, wrong type,
+        # blank -- a legacy/malformed row; 0 such rows exist post-migration) falls back to
+        # the OLD `detail`-based check below.
+        evidence_raw = payload.get("evidence")
+        evidence_text = evidence_raw.strip() if isinstance(evidence_raw, str) else ""
+
+        if evidence_text:
+            if not _verbatim_ok(evidence_text, canonical_text_ or ""):
+                # `evidence` passed the DB's verbatim gate at mint time, so a FRESH
+                # mismatch here is a genuine anti-fabrication finding -- the page changed
+                # (or the row was corrupted) since mint -- exactly like a VoC quote that no
+                # longer verifies. The KNOWN GAP that used to force 'abstained' here for
+                # EVERY finding is CLOSED for every evidence-bearing one.
+                return RESULT_UNSUPPORTED, {
+                    "reason": "verbatim_failed",
+                    "evidence_kind": evidence_kind,
+                    "checked_against": "canonical_text",
+                }
+        else:
+            # LEGACY / malformed fallback: nothing authoritative to re-ground against, so
+            # fall back to `detail`, which is only reliably verbatim when it happens to be
+            # the model's original evidence snippet folded in at mint time because
+            # `detail` was otherwise blank (the pre-first-class-evidence convention; see
+            # `worker.extract._mint_findings`). A failed check here proves nothing about
+            # whether the finding is actually wrong -- only that this module has nothing
             # authoritative left to re-ground against. "Cannot verify" is ABSTAIN, never
-            # refute: this must NOT be scored 'unsupported' (that would be a false
-            # positive fabrication-detection on a finding that may be perfectly true).
-            # Follow-up (filed by Opus, not this task): persist findings' real verbatim
-            # evidence at mint time (a collect-side schema change) so this can genuinely
-            # re-ground every finding, not just the ones lucky enough to have had a blank
-            # `detail`.
-            return RESULT_ABSTAINED, {
-                "reason": "finding_evidence_not_recoverable",
-                "evidence_kind": evidence_kind,
-                "checked_against": "canonical_text",
-            }
+            # refute: absence of `evidence` must NEVER be reinterpreted as a refutation.
+            detail_text = (payload.get("detail") or "").strip()
+            if not _verbatim_ok(detail_text, canonical_text_ or ""):
+                return RESULT_ABSTAINED, {
+                    "reason": "finding_evidence_not_recoverable",
+                    "evidence_kind": evidence_kind,
+                    "checked_against": "canonical_text",
+                }
 
         label = {
             "kind": "site_fact",

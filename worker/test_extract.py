@@ -681,13 +681,13 @@ def test_run_collect_happy_path_mints_valid_quotes_and_findings(monkeypatch):
     # capture it was extracted from.
     assert minted_quote["capture_id"] == "cap-1"
 
-    # The one minted finding was evidenced against the CANONICAL (whole-page) text. Its
-    # `detail` was blank, so the verbatim `evidence` was folded into `detail`; `evidence`
-    # itself is never sent to the RPC (not part of the registered site_fact v1 payload).
+    # The one minted finding was evidenced against the CANONICAL (whole-page) text.
+    # `evidence` is persisted first-class in the payload; `detail` was blank at mint time
+    # so it is simply omitted (no longer folded from `evidence`).
     assert len(fake_store.findings) == 1
     minted_finding = fake_store.findings[0]
     assert minted_finding["payload"] == {
-        "fact_type": "pricing", "statement": "Buy 2 get 1 free", "detail": "today only!",
+        "fact_type": "pricing", "statement": "Buy 2 get 1 free", "evidence": "today only!",
     }
     assert minted_finding["raw_content"] == CANONICAL_TEXT
     assert minted_finding["project_id"] == "proj-1"
@@ -1043,10 +1043,11 @@ def test_run_collect_finding_with_blank_evidence_is_dropped(monkeypatch):
     assert fake_store.findings == []
 
 
-def test_run_collect_finding_evidence_not_folded_when_detail_present(monkeypatch):
-    """When the model DID supply a non-blank `detail`, the verbatim `evidence` is used
-    only as the grounding gate and then discarded -- never appended to or overwriting the
-    model's own `detail`."""
+def test_run_collect_finding_payload_persists_evidence_and_detail_as_separate_fields(monkeypatch):
+    """`evidence` is persisted FIRST-CLASS in the minted payload -- no longer folded into
+    `detail` or discarded -- so it stays available as an authoritative verbatim span.
+    When the model DID supply a non-blank `detail` of its own, both fields land in the
+    payload, unmodified and distinct: `detail` is never overwritten by `evidence`."""
     fake_store = _FakeStore(
         capture=_capture(),
         objects={"captures/canonsha.txt": CANONICAL_TEXT.encode("utf-8"),
@@ -1067,8 +1068,34 @@ def test_run_collect_finding_evidence_not_folded_when_detail_present(monkeypatch
 
     assert fake_store.findings[0]["payload"] == {
         "fact_type": "pricing", "statement": "Buy 2 get 1 free",
-        "detail": "limited to the first 100 orders",
+        "evidence": "today only!", "detail": "limited to the first 100 orders",
     }
+
+
+def test_run_collect_finding_payload_omits_detail_when_model_gives_none(monkeypatch):
+    """`detail` is added to the minted payload only when the model actually supplied
+    non-blank supporting detail of its own -- `evidence` is always present regardless."""
+    fake_store = _FakeStore(
+        capture=_capture(),
+        objects={"captures/canonsha.txt": CANONICAL_TEXT.encode("utf-8"),
+                  "captures/rawsha.html": RAW_HTML.encode("utf-8")},
+    )
+    payload = {
+        "quotes": [],
+        "findings": [
+            {"fact_type": "pricing", "statement": "Buy 2 get 1 free",
+             "detail": "", "evidence": "today only!", "confidence": "medium"},
+        ],
+    }
+    resp = _FakeResponse(payload)
+    _wire(monkeypatch, fake_store, resp)
+
+    extract.run_collect(_job(), "claimant-1")
+
+    assert fake_store.findings[0]["payload"] == {
+        "fact_type": "pricing", "statement": "Buy 2 get 1 free", "evidence": "today only!",
+    }
+    assert "detail" not in fake_store.findings[0]["payload"]
 
 
 # ===========================================================================

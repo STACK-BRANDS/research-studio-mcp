@@ -314,6 +314,10 @@ def test_run_verify_clean_voc_member_records_supported(monkeypatch):
 
 
 def test_run_verify_finding_member_grounded_records_supported(monkeypatch):
+    """LEGACY fallback path: `_finding_row()`'s default payload carries no `evidence` key
+    at all (only `detail`), so this exercises the OLD `detail`-based check -- kept
+    passing to prove the legacy fallback still grounds and proceeds to the label pass
+    exactly as before this change."""
     fake_store = _FakeStore(
         capture=_capture(), objects=_objects(),
         members=[_member("finding", "finding-1")],
@@ -328,6 +332,35 @@ def test_run_verify_finding_member_grounded_records_supported(monkeypatch):
     outcome = fake_store.outcome_calls[0]
     assert outcome["evidence_kind"] == "finding"
     assert outcome["evidence_id"] == "finding-1"
+    assert outcome["result"] == "supported"
+    assert len(hooks["anthropic_calls"]) == 1
+
+
+def test_run_verify_finding_evidence_verbatim_grounds_and_proceeds_to_label_pass(monkeypatch):
+    """First-class `payload.evidence` path (the whole point of this change): a finding
+    minted with a verbatim `evidence` span verifies against the FRESHLY re-downloaded
+    canonical text and proceeds to the adversarial label pass -- never abstains just
+    because `detail` itself isn't a verbatim excerpt."""
+    fake_store = _FakeStore(
+        capture=_capture(), objects=_objects(),
+        members=[_member("finding", "finding-1")],
+        findings={"finding-1": _finding_row(
+            payload={
+                "fact_type": "pricing", "statement": "Buy 2 get 1 free",
+                "evidence": "today only!",
+                "detail": "the model's own non-verbatim elaboration, not on the page",
+            },
+        )},
+    )
+    resp = _FakeResponse({"verdict": "supported", "rationale": "the page says buy 2 get 1 free"})
+    hooks = _wire(monkeypatch, fake_store, resp)
+
+    result = verify.run_verify(_job(), "claimant-1")
+
+    assert result["supported"] == 1
+    assert result["abstained"] == 0
+    outcome = fake_store.outcome_calls[0]
+    assert outcome["evidence_kind"] == "finding"
     assert outcome["result"] == "supported"
     assert len(hooks["anthropic_calls"]) == 1
 
@@ -357,17 +390,90 @@ def test_run_verify_quote_no_longer_verbatim_records_unsupported_without_paid_ca
     assert hooks["anthropic_calls"] == []
 
 
+def test_run_verify_finding_evidence_mismatch_records_unsupported_without_paid_call(monkeypatch):
+    """The evidence-bearing counterpart of the quote test above -- the KNOWN GAP this
+    change closes. A finding whose persisted `payload.evidence` is a non-blank string
+    but is NO LONGER verbatim-present in the freshly re-downloaded canonical text is a
+    genuine anti-fabrication finding (the page changed, or the row was corrupted), so it
+    is scored `'unsupported'` deterministically -- never `'abstained'`, and never via the
+    paid label pass."""
+    fake_store = _FakeStore(
+        capture=_capture(), objects=_objects(),
+        members=[_member("finding", "finding-1")],
+        findings={"finding-1": _finding_row(
+            payload={
+                "fact_type": "pricing", "statement": "Buy 2 get 1 free",
+                "evidence": "this exact sentence is nowhere on the page anymore",
+                "detail": "",
+            },
+        )},
+    )
+    hooks = _wire(monkeypatch, fake_store, resp=None)
+
+    result = verify.run_verify(_job(), "claimant-1")
+
+    assert result["unsupported"] == 1
+    assert result["abstained"] == 0
+    outcome = fake_store.outcome_calls[0]
+    assert outcome["result"] == "unsupported"
+    assert outcome["check_detail"]["reason"] == "verbatim_failed"
+    assert outcome["check_detail"]["checked_against"] == "canonical_text"
+    # No paid call at all -- the reserve/Anthropic path is never touched, same discipline
+    # as the quote path's deterministic refutation.
+    assert hooks["reserve_calls"] == []
+    assert hooks["anthropic_calls"] == []
+
+
 def test_run_verify_finding_not_grounded_abstains_without_paid_call(monkeypatch):
-    """P1-2: a finding whose `detail` is NOT a verbatim excerpt of the canonical text
-    cannot be re-grounded (the registered site_fact v1 payload never persists the
-    model's original verbatim `evidence` snippet -- only `detail`, which equals the
-    verbatim evidence ONLY when it was blank at mint time). "Cannot verify" is ABSTAIN,
-    never a false 'unsupported' refutation."""
+    """P1-2 / LEGACY fallback (scenario c): a finding with NO `evidence` key at all --
+    only `detail`, which is NOT a verbatim excerpt of the canonical text -- has nothing
+    authoritative to re-ground against (0 such rows exist post-migration; this stays
+    robust regardless). "Cannot verify" is ABSTAIN, never a false 'unsupported'
+    refutation -- absence of `evidence` must NEVER be reinterpreted as a refutation."""
     fake_store = _FakeStore(
         capture=_capture(), objects=_objects(),
         members=[_member("finding", "finding-1")],
         findings={"finding-1": _finding_row(
             payload={"fact_type": "pricing", "statement": "x", "detail": "not on the page at all"},
+        )},
+    )
+    hooks = _wire(monkeypatch, fake_store, resp=None)
+
+    result = verify.run_verify(_job(), "claimant-1")
+
+    assert result["abstained"] == 1
+    assert result["unsupported"] == 0
+    outcome = fake_store.outcome_calls[0]
+    assert outcome["result"] == "abstained"
+    assert outcome["check_detail"]["reason"] == "finding_evidence_not_recoverable"
+    assert outcome["check_detail"]["checked_against"] == "canonical_text"
+    assert hooks["anthropic_calls"] == []
+
+
+@pytest.mark.parametrize("bad_evidence", [
+    None,     # JSON null -- absent evidence, must never be coerced/trusted.
+    42,       # a number -- wrong type entirely, never coerced/trusted.
+    "",       # empty string -- blank, same as absent.
+    "   ",    # whitespace-only string -- blank after strip(), same as absent.
+])
+def test_run_verify_finding_malformed_evidence_falls_back_to_detail_and_abstains(monkeypatch, bad_evidence):
+    """The `evidence_raw.strip() if isinstance(evidence_raw, str) else ""` guard in
+    `_check_member`: JSON null, a non-string (a number), and an empty/whitespace string
+    must ALL fall back to the LEGACY `detail`-based check exactly like a fully-absent
+    `evidence` key -- never crash (`.strip()` on a non-string would raise `AttributeError`
+    if the isinstance guard were missing), and never be scored as a verbatim MISMATCH
+    (`'unsupported'`) just because the malformed value isn't trusted. When the fallback
+    `detail` also fails to verify, the result is `'abstained'` -- proving malformed/absent
+    `evidence` is never reinterpreted as a refutation."""
+    fake_store = _FakeStore(
+        capture=_capture(), objects=_objects(),
+        members=[_member("finding", "finding-1")],
+        findings={"finding-1": _finding_row(
+            payload={
+                "fact_type": "pricing", "statement": "x",
+                "evidence": bad_evidence,
+                "detail": "not on the page at all",
+            },
         )},
     )
     hooks = _wire(monkeypatch, fake_store, resp=None)
