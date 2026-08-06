@@ -1260,6 +1260,9 @@ def test_build_synthesis_schema_shape():
     ref_items = pain_items["properties"]["evidence_refs"]["items"]
     assert ref_items["additionalProperties"] is False
     assert set(ref_items["required"]) == {"kind", "id"}
+    # The VoC pain-map's model-facing citation enum stays EXACTLY voc/finding -- the A3 whitespace
+    # deliverable does NOT widen this shared enum (its refs are built worker-side, never model-echoed),
+    # so the VoC model can never emit an 'angle' citation its own validators cannot handle.
     assert ref_items["properties"]["kind"]["enum"] == ["voc", "finding"]
 
 

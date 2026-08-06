@@ -184,9 +184,17 @@ PROPOSED_RESEARCH_SCHEMA = {
 # NOT change. See `build_synthesis_schema()`'s own docstring for the split.
 # ---------------------------------------------------------------------------
 
-# The two `research_publishable_evidence` kinds a synthesis's `evidence_refs` may cite --
-# mirrors `worker.verify.EVIDENCE_KIND_VOC`/`EVIDENCE_KIND_FINDING`, duplicated here (not
+# The `research_publishable_evidence`/sealed-evidence kinds a synthesis's `evidence_refs` may
+# cite -- mirrors `worker.verify.EVIDENCE_KIND_VOC`/`EVIDENCE_KIND_FINDING`, duplicated here (not
 # imported) per this worker's own established per-call-site-duplication convention.
+#
+# This feeds the VoC pain-map's model-facing `{kind, id}` ref enum
+# (`_build_synthesis_evidence_ref_schema()` below). It stays EXACTLY the VoC/finding pair: the A3
+# whitespace deliverable does NOT add an 'angle' member here (nor to
+# `worker.synthesize._VALID_EVIDENCE_KINDS`) -- widening this shared enum would let the VoC model
+# emit an 'angle' citation its own read-seam/validators cannot handle, regressing the VoC path.
+# A3's `evidence_refs` are built ENTIRELY worker-side as `{"table": ..., "id": ...}` (the rollup
+# batch header + every rollup row), never model-echoed, so there is no model-facing slot for it.
 SYNTHESIS_EVIDENCE_KINDS = ["voc", "finding"]
 
 
@@ -247,6 +255,60 @@ def build_synthesis_schema() -> dict:
             "pains": {"type": "array", "items": _build_synthesis_pain_schema()},
         },
         "required": ["title", "pains"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# The `synthesize` job's A3 WHITESPACE structured-output schema (Research Studio v2.1, migration
+# 174/176 angle-rollup wiring) -- the angle-dimension analog of `build_synthesis_schema()` above,
+# for `worker.synthesize.run_whitespace_synthesis`. Has a live-registry dependency (the model may
+# only name an ACTIVE `research_angle_registry` key), so `angle_keys` is a required, caller-
+# supplied list here -- unlike `build_synthesis_schema()`, which has nothing dynamic to gate on,
+# `build_whitespace_schema()` mirrors `build_analysis_schema()`'s dynamic-enum shape instead.
+# ---------------------------------------------------------------------------
+
+def _build_whitespace_candidate_schema(angle_keys: list[str]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "angle_key": {"type": "string", "enum": angle_keys},
+            "summary": {"type": "string"},
+        },
+        "required": ["angle_key", "summary"],
+    }
+
+
+def build_whitespace_schema(angle_keys: list[str] | None = None) -> dict:
+    """Strict Anthropic structured-output schema for the `synthesize` job's A3 whitespace
+    deliverable: a list of `candidates`, each an ACTIVE registry `angle_key` plus a `summary`.
+    `angle_keys` constrains the enum exactly like `build_analysis_schema`'s per-ad `angle_key`; when
+    omitted, queries the live registry (via `active_angle_registry()`, same fallback as that
+    function) -- `worker.synthesize.run_whitespace_synthesis` always passes the keys it already
+    fetched for the census-block prompt, so this never triggers a second query in practice.
+
+    Deliberately carries NEITHER a `title` NOR an `evidence_refs` field, unlike
+    `build_synthesis_schema()`'s VoC pain-map shape -- both are stronger-honesty departures A3
+    makes on purpose (Fable-memo-resolved, 2026-08-06):
+      - `title` is entirely WORKER-COMPOSED (it must carry the coverage bound verbatim -- "among N
+        captured competitors" -- never left to the model's own phrasing); there is nothing for the
+        model to author here.
+      - `evidence_refs` is entirely WORKER-BUILT: exactly one `research_angle_rollup_batches`
+        header ref plus EVERY `research_angle_rollups` row of that batch, regardless of which
+        angle_keys the model actually discusses (absence is closed-world -- an angle nobody runs
+        has no rollup row, so the BATCH itself is the evidence for that absence). There is no
+        `{kind, id}` ref shape for the model to echo, unlike a VoC pain's citations -- see
+        `run_whitespace_synthesis`'s own docstring for the full citation model.
+    """
+    if angle_keys is None:
+        angle_keys = angle_keys_from_registry(active_angle_registry())
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "candidates": {"type": "array", "items": _build_whitespace_candidate_schema(angle_keys)},
+        },
+        "required": ["candidates"],
     }
 
 

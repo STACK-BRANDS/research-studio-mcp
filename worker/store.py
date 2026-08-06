@@ -1447,6 +1447,95 @@ def get_theme_rollup_batch(batch_id: str) -> dict:
     return {"header": header_res.data[0], "rows": rows_res.data or []}
 
 
+# ---------------------------------------------------------------------------
+# A3 WHITESPACE (Research Studio v2.1, migrations 174/176) -- the angle-dimension analog of the
+# theme-rollup seam directly above. `compute_angle_rollups`/`get_angle_rollup_batch` ground
+# `worker.synthesize.run_whitespace_synthesis`'s coverage-bounded competitor-angle census. Same
+# job-spine banner as the P4 PRODUCTION section above: NEITHER wrapper is best-effort.
+# ---------------------------------------------------------------------------
+
+def compute_angle_rollups() -> str:
+    """Call the deployed `rs_compute_angle_rollups` RPC (migration 174, LIVE): computes a fresh,
+    SEALED, deterministic, GLOBAL competitor-angle rollup batch over the tracked-competitor set's
+    latest-'ok'-analysis, provenance-verified `research_angle_observations` (173), and returns the
+    new batch's id. SECURITY DEFINER; service_role has EXECUTE.
+
+    Unlike `compute_theme_rollups`, this RPC takes NO PARAMETERS at all -- the angle rollup is
+    GLOBAL over the whole tracked-competitor set: `research_analyses`/`research_angle_observations`
+    carry no store/project scope to narrow by (migration 174's own SCOPE DECISION note). Every call
+    mints a NEW batch (never updates an existing one in place) -- the same deterministic,
+    SQL-computed counting layer `run_whitespace_synthesis` grounds its whitespace verdict's counts,
+    `thin_data`, and `confidence` in, and whose batch header + rollup rows become the synthesis's
+    own worker-built `evidence_refs` (migration 176 made both tables citable, existence-only).
+
+    NOT best-effort (see the job-spine banner above this section): any RPC failure (a DB error, an
+    invariant-violation RAISE inside the RPC -- see 174's own P2-b assert) propagates unchanged --
+    `run_whitespace_synthesis` treats this exactly like `run_synthesize` treats
+    `compute_theme_rollups`'s own failure: a pre-reserve failure, returns `("failed", 0, ...)` with
+    nothing reserved.
+    """
+    sb = _client()
+    res = sb.rpc("rs_compute_angle_rollups", {}).execute()
+    return res.data
+
+
+def get_angle_rollup_batch(batch_id: str) -> dict:
+    """Read back one angle-rollup batch minted by `compute_angle_rollups` -- `{"header": {...},
+    "rows": [...]}`. The angle-dimension analog of `get_theme_rollup_batch` directly above.
+
+    `header` is the single `research_angle_rollup_batches` row keyed by `batch_id` (`basis` jsonb
+    -- carries `scope`, `classification`, `countable_basis`, `countable_set`, `recency_order`,
+    `unmapped`, `grade_is_display_only`, `selected_competitors`, `competitors_with_observations`,
+    `coverage_gap` -- plus `computed_at`, `schema_version`; no `store_id`/`project_id` columns
+    exist on this table -- the rollup is global, see `compute_angle_rollups`'s own docstring).
+    `rows` is every `research_angle_rollups` row stamped with this `batch_id` -- `angle_key`,
+    `competitor_count`, `total_ad_count`, `body_verbatim_count`, `not_body_verified_count`,
+    `member_competitor_ids`, `member_analysis_ids` -- PLUS each row's own `id`.
+
+    That trailing `id` is the one deliberate divergence from `get_theme_rollup_batch`'s own column
+    list: a theme-rollup row only ever GROUNDS the VoC pain-map's narrative (its counts land in the
+    minted payload, but the row itself is never cited as evidence). Migration 176 made
+    `research_angle_rollups` ITSELF citable (existence-only) -- `run_whitespace_synthesis` cites
+    the batch header plus every rollup row it reads back here, by `id`, so the id must be selected
+    or there would be nothing for the worker to build a `{"table": "research_angle_rollups", "id":
+    ...}` evidence ref out of.
+
+    Raises `ValueError` if no header row matches `batch_id` -- should be unreachable in practice
+    (the caller always reads back the exact id `compute_angle_rollups` itself just returned), but
+    never silently collapsed into an empty/zero-row batch, mirroring `get_theme_rollup_batch`'s own
+    no-silent-empty rule: a genuinely EMPTY batch (0 rollup rows -- every selected competitor
+    contributed zero observations, a real, disclosed outcome per 174's own `basis`) is a different,
+    legitimate condition from a missing header, and the caller (the degenerate-census refusal in
+    `run_whitespace_synthesis`) must be able to tell the two apart.
+
+    NOT best-effort (see the job-spine banner above this section): `run_whitespace_synthesis`
+    derives its deterministic `thin_data`/confidence verdict and its worker-built `evidence_refs`
+    directly from this read -- any other failure (network, auth, DB error) propagates unchanged
+    rather than being mistaken for "nothing to roll up".
+    """
+    sb = _client()
+    header_res = (
+        sb.table("research_angle_rollup_batches")
+        .select("batch_id, basis, computed_at, schema_version")
+        .eq("batch_id", batch_id)
+        .limit(1)
+        .execute()
+    )
+    if not header_res.data:
+        raise ValueError(f"get_angle_rollup_batch: no batch header found for batch_id={batch_id!r}")
+
+    rows_res = (
+        sb.table("research_angle_rollups")
+        .select(
+            "id, angle_key, competitor_count, total_ad_count, body_verbatim_count, "
+            "not_body_verified_count, member_competitor_ids, member_analysis_ids"
+        )
+        .eq("batch_id", batch_id)
+        .execute()
+    )
+    return {"header": header_res.data[0], "rows": rows_res.data or []}
+
+
 def get_finding(finding_id: str) -> Optional[dict]:
     """Read one `research_findings` row by id -- `finding_kind`, `schema_version`,
     `payload` (jsonb: `fact_type`/`statement`/`evidence`/optional `detail` for a
