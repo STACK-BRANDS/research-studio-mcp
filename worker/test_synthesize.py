@@ -1,13 +1,15 @@
-"""Tests for the `synthesize` job (P4 PRODUCER of the deep-research plan, v2.0):
-worker/synthesize.py's `run_synthesize` + its pure helpers, and the two new worker/
-store.py wrappers it depends on (get_publishable_evidence, rs_create_synthesis).
+"""Tests for the `synthesize` job (P4 PRODUCER of the deep-research plan, v2.1):
+worker/synthesize.py's `run_synthesize` + its pure helpers, and the worker/store.py
+wrappers it depends on (get_publishable_evidence, compute_theme_rollups,
+get_theme_rollup_batch, rs_create_synthesis).
 
 No network, no real Supabase, no real Anthropic call: every collaborator
 (`synthesize.store`, `synthesize.jobs.assert_lease`, `synthesize.budget.reserve`/
 `settle`, `synthesize.Anthropic`, `synthesize.usage_reporter`) is monkeypatched directly
 on the module objects that use them -- the exact same pattern `worker/test_verify.py`
-and `worker/test_extract.py` use. The deployed RPC itself (`rs_create_synthesis`) is NOT
-re-tested here -- migration 157 owns that; this file tests only the Python driving it.
+and `worker/test_extract.py` use. The deployed RPCs themselves (`rs_create_synthesis`,
+`rs_compute_theme_rollups`, migrations 157/170) are NOT re-tested here -- those
+migrations own that; this file tests only the Python driving them.
 """
 import json
 
@@ -162,6 +164,103 @@ def test_rs_create_synthesis_propagates_rpc_exception(monkeypatch):
 
 
 # ===========================================================================
+# worker/store.py -- compute_theme_rollups / get_theme_rollup_batch (v2.1, migration
+# 170 theme-rollup wiring), tested directly against fake Supabase clients.
+# ===========================================================================
+
+def test_compute_theme_rollups_sends_expected_params_and_returns_batch_id(monkeypatch):
+    client = _FakeRpcClient(rpc_response="batch-1")
+    monkeypatch.setattr(store, "_client", lambda: client)
+
+    batch_id = store.compute_theme_rollups("mv", project_id="proj-1")
+
+    assert batch_id == "batch-1"
+    assert client.rpcs[0].name == "rs_compute_theme_rollups"
+    assert client.rpcs[0].params == {"p_store_id": "mv", "p_project_id": "proj-1"}
+
+
+def test_compute_theme_rollups_sends_explicit_none_project_id_when_omitted(monkeypatch):
+    client = _FakeRpcClient(rpc_response="batch-2")
+    monkeypatch.setattr(store, "_client", lambda: client)
+
+    store.compute_theme_rollups("mv")
+
+    assert client.rpcs[0].params == {"p_store_id": "mv", "p_project_id": None}
+
+
+def test_compute_theme_rollups_propagates_rpc_exception(monkeypatch):
+    client = _FakeRpcClient(raise_exc=RuntimeError("db exploded"))
+    monkeypatch.setattr(store, "_client", lambda: client)
+    with pytest.raises(RuntimeError, match="db exploded"):
+        store.compute_theme_rollups("mv")
+
+
+class _FakeMultiTableClient:
+    """Routes `.table(name)` to a per-table fixed row list -- unlike `_FakeTableClient`
+    above (which serves one row list regardless of table name), `get_theme_rollup_batch`
+    reads from TWO distinct tables (`research_theme_rollup_batches` header,
+    `research_theme_rollups` rows) in one call, so the fake must tell them apart."""
+
+    def __init__(self, tables: dict):
+        self._tables = tables
+        self.queries = []
+
+    def table(self, name):
+        q = _FakeQuery(self._tables.get(name, []))
+        self.queries.append((name, q))
+        return q
+
+
+def test_get_theme_rollup_batch_returns_header_and_rows(monkeypatch):
+    header_row = {
+        "batch_id": "batch-1", "basis": {"total_publishable_quotes": 12, "as_of": "2026-08-01T00:00:00Z"},
+        "computed_at": "2026-08-01T00:00:00Z", "store_id": "mv", "project_id": None,
+    }
+    matching_row = {
+        "theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal",
+        "member_quote_ids": ["q1", "q2"], "example_quote_ids": ["q1"], "batch_id": "batch-1",
+    }
+    other_batch_row = {
+        "theme": "other", "quote_type": "praise", "count": 9, "data_density": "normal",
+        "member_quote_ids": [], "example_quote_ids": [], "batch_id": "batch-OTHER",
+    }
+    client = _FakeMultiTableClient({
+        "research_theme_rollup_batches": [header_row],
+        "research_theme_rollups": [matching_row, other_batch_row],
+    })
+    monkeypatch.setattr(store, "_client", lambda: client)
+
+    result = store.get_theme_rollup_batch("batch-1")
+
+    assert result == {"header": header_row, "rows": [matching_row]}
+
+
+def test_get_theme_rollup_batch_raises_when_header_missing(monkeypatch):
+    client = _FakeMultiTableClient({
+        "research_theme_rollup_batches": [], "research_theme_rollups": [],
+    })
+    monkeypatch.setattr(store, "_client", lambda: client)
+
+    with pytest.raises(ValueError, match="batch_id"):
+        store.get_theme_rollup_batch("missing-batch")
+
+
+def test_get_theme_rollup_batch_returns_empty_rows_when_batch_has_none(monkeypatch):
+    header_row = {
+        "batch_id": "batch-empty", "basis": {"total_publishable_quotes": 0, "as_of": None},
+        "computed_at": "2026-08-01T00:00:00Z", "store_id": "mv", "project_id": None,
+    }
+    client = _FakeMultiTableClient({
+        "research_theme_rollup_batches": [header_row], "research_theme_rollups": [],
+    })
+    monkeypatch.setattr(store, "_client", lambda: client)
+
+    result = store.get_theme_rollup_batch("batch-empty")
+
+    assert result == {"header": header_row, "rows": []}
+
+
+# ===========================================================================
 # worker/synthesize.py -- run_synthesize, stubbed Anthropic + store.
 # ===========================================================================
 
@@ -225,20 +324,66 @@ class _RaisingAnthropicClient:
         raise self._exc
 
 
+def _default_rollup_header(batch_id):
+    # Ample by default (total_publishable_quotes >= _THIN_DATA_MIN_EVIDENCE, no thin
+    # rows) so every test that doesn't care about thin_data gets thin_data=False,
+    # matching this module's pre-v2.1 default expectations.
+    return {
+        "batch_id": batch_id,
+        "basis": {"total_publishable_quotes": 20, "as_of": "2026-01-01T00:00:00Z"},
+        "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
+    }
+
+
+def _default_rollup_rows():
+    return [
+        {"theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal",
+         "member_quote_ids": ["quote-0", "quote-1"], "example_quote_ids": ["quote-0"]},
+    ]
+
+
 class _FakeSynthesizeStore:
     """Records every call; `get_publishable_evidence` returns a fixed evidence set,
-    `rs_create_synthesis` records its call and either returns a fixed id or raises."""
+    `compute_theme_rollups`/`get_theme_rollup_batch` return a fixed (or raising) rollup
+    batch, `rs_create_synthesis` records its call and either returns a fixed id or
+    raises."""
 
-    def __init__(self, evidence=None, create_raises=None, create_returns="syn-1"):
+    def __init__(
+        self, evidence=None, create_raises=None, create_returns="syn-1",
+        rollup_batch_id="rollup-batch-1", rollup_header=None, rollup_rows=None,
+        compute_rollup_raises=None, get_rollup_raises=None,
+    ):
         self.evidence = evidence if evidence is not None else []
         self.create_raises = create_raises
         self.create_returns = create_returns
         self.get_publishable_evidence_calls = []
         self.create_synthesis_calls = []
 
+        self.rollup_batch_id = rollup_batch_id
+        self.rollup_header = (
+            rollup_header if rollup_header is not None else _default_rollup_header(rollup_batch_id)
+        )
+        self.rollup_rows = rollup_rows if rollup_rows is not None else _default_rollup_rows()
+        self.compute_rollup_raises = compute_rollup_raises
+        self.get_rollup_raises = get_rollup_raises
+        self.compute_theme_rollups_calls = []
+        self.get_theme_rollup_batch_calls = []
+
     def get_publishable_evidence(self, store_id, limit=None):
         self.get_publishable_evidence_calls.append((store_id, limit))
         return list(self.evidence)
+
+    def compute_theme_rollups(self, store_id, project_id=None):
+        self.compute_theme_rollups_calls.append((store_id, project_id))
+        if self.compute_rollup_raises is not None:
+            raise self.compute_rollup_raises
+        return self.rollup_batch_id
+
+    def get_theme_rollup_batch(self, batch_id):
+        self.get_theme_rollup_batch_calls.append(batch_id)
+        if self.get_rollup_raises is not None:
+            raise self.get_rollup_raises
+        return {"header": self.rollup_header, "rows": list(self.rollup_rows)}
 
     def rs_create_synthesis(self, **kwargs):
         self.create_synthesis_calls.append(kwargs)
@@ -351,10 +496,12 @@ def test_run_synthesize_happy_path_creates_synthesis_with_cited_refs(monkeypatch
     call = fake_store.create_synthesis_calls[0]
     assert call["store_id"] == "mv"
     assert call["kind"] == "pain_map"
-    assert call["schema_version"] == 1
+    assert call["schema_version"] == 2  # bumped 1 -> 2, v2.1 rollup block.
     assert call["confidence"] in {"high", "medium", "low"}
     assert call["origin"] == "agent"
-    assert call["thin_data"] is False  # 10 items >= _THIN_DATA_MIN_EVIDENCE (8)
+    # thin_data now comes from the fake store's default rollup fixture (ample:
+    # total_publishable_quotes=20, no thin rows), NOT from len(evidence).
+    assert call["thin_data"] is False
     assert call["area"] == "pdp"
     assert call["project_id"] == "proj-1"
     assert set(call["evidence_refs"][0]) == {"table", "id"}
@@ -363,11 +510,19 @@ def test_run_synthesize_happy_path_creates_synthesis_with_cited_refs(monkeypatch
     assert call["payload"]["pains"][0]["evidence_refs"] == [
         {"kind": "voc", "id": "quote-0"}, {"kind": "voc", "id": "quote-1"},
     ]
+    assert call["payload"]["rollup"] == {
+        "batch_id": "rollup-batch-1", "as_of": "2026-01-01T00:00:00Z",
+        "total_publishable_quotes": 20,
+        "themes": [
+            {"theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal"},
+        ],
+    }
 
     assert len(hooks["anthropic_calls"]) == 1
     assert len(hooks["usage_calls"]) == 1
     assert hooks["usage_calls"][0]["input_tokens"] == 200
     assert hooks["usage_calls"][0]["output_tokens"] == 80
+    assert hooks["usage_calls"][0]["meta"]["rollup_batch_id"] == "rollup-batch-1"
 
 
 def test_run_synthesize_maps_finding_kind_to_research_findings_table(monkeypatch):
@@ -433,6 +588,10 @@ def test_run_synthesize_empty_publishable_set_fails_without_spend(monkeypatch):
     assert hooks["reserve_calls"] == []
     assert hooks["anthropic_calls"] == []
     assert fake_store.create_synthesis_calls == []
+    # The rollup compute never runs on an empty evidence set -- the early return above
+    # happens BEFORE step 3 in the docstring's order of operations.
+    assert fake_store.compute_theme_rollups_calls == []
+    assert fake_store.get_theme_rollup_batch_calls == []
 
 
 # ===========================================================================
@@ -668,12 +827,28 @@ def test_run_synthesize_provider_error_settles_worst_case(monkeypatch):
 
 
 # ===========================================================================
-# thin_data: below-threshold evidence count -> synthesis created with thin_data=True.
+# thin_data (v2.1): DERIVED from the deterministic rollup batch, never from
+# len(evidence). Two independent ways to end up thin: a low basis.
+# total_publishable_quotes, or every rollup row coming back data_density='thin'.
 # ===========================================================================
 
-def test_run_synthesize_thin_evidence_sets_thin_data_true(monkeypatch):
-    evidence = _publishable_set(3)  # < _THIN_DATA_MIN_EVIDENCE (8)
-    fake_store = _FakeSynthesizeStore(evidence=evidence)
+def test_run_synthesize_thin_rollup_basis_sets_thin_data_true(monkeypatch):
+    """thin_data is TRUE when the rollup batch's own basis.total_publishable_quotes is
+    below `_THIN_DATA_MIN_EVIDENCE` -- regardless of how many rows this run's separately
+    capped citable-`evidence` list happens to carry."""
+    evidence = _publishable_set(10)  # ample citable evidence -- deliberately NOT thin.
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence,
+        rollup_header={
+            "id": "rollup-batch-1",
+            "basis": {"total_publishable_quotes": 3, "as_of": "2026-01-01T00:00:00Z"},
+            "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
+        },
+        rollup_rows=[
+            {"theme": "fit", "quote_type": "complaint", "count": 3, "data_density": "normal",
+             "member_quote_ids": ["quote-0"], "example_quote_ids": ["quote-0"]},
+        ],
+    )
     resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
     _wire(monkeypatch, fake_store, resp)
 
@@ -682,20 +857,190 @@ def test_run_synthesize_thin_evidence_sets_thin_data_true(monkeypatch):
     assert status == "done"
     call = fake_store.create_synthesis_calls[0]
     assert call["thin_data"] is True
-    # Thin data still confidence-caps below 'high' (mirrors the module's own derivation
-    # rule: _CONFIDENCE_HIGH_MIN_EVIDENCE == _THIN_DATA_MIN_EVIDENCE).
-    assert call["confidence"] != "high"
+    assert call["payload"]["rollup"]["total_publishable_quotes"] == 3
 
 
-def test_run_synthesize_ample_evidence_sets_thin_data_false(monkeypatch):
-    evidence = _publishable_set(20)
+def test_run_synthesize_all_rollup_rows_thin_sets_thin_data_true(monkeypatch):
+    """thin_data is ALSO true when every rollup row came back data_density='thin', even
+    if the batch's own total_publishable_quotes count is at/above the threshold."""
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence,
+        rollup_header={
+            "id": "rollup-batch-1",
+            "basis": {"total_publishable_quotes": 20, "as_of": "2026-01-01T00:00:00Z"},
+            "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
+        },
+        rollup_rows=[
+            {"theme": "fit", "quote_type": "complaint", "count": 2, "data_density": "thin",
+             "member_quote_ids": ["quote-0"], "example_quote_ids": ["quote-0"]},
+            {"theme": "shipping", "quote_type": "praise", "count": 1, "data_density": "thin",
+             "member_quote_ids": ["quote-1"], "example_quote_ids": ["quote-1"]},
+        ],
+    )
+    resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
+    _wire(monkeypatch, fake_store, resp)
+
+    status, _cost, _error = synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert status == "done"
+    assert fake_store.create_synthesis_calls[0]["thin_data"] is True
+
+
+def test_run_synthesize_ample_rollup_sets_thin_data_false(monkeypatch):
+    """The default fake-store rollup fixture (total_publishable_quotes=20, one 'normal'
+    row) is deliberately ample -- confirms the mainline (non-thin) path."""
+    evidence = _publishable_set(10)
     fake_store = _FakeSynthesizeStore(evidence=evidence)
+    resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
+    _wire(monkeypatch, fake_store, resp)
+
+    status, _cost, _error = synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert status == "done"
+    assert fake_store.create_synthesis_calls[0]["thin_data"] is False
+
+
+def test_run_synthesize_thin_data_ignores_zero_row_batch_vacuous_truth(monkeypatch):
+    """A batch with zero rollup rows is NOT "all thin" by vacuous truth -- thin_data
+    falls through to the count-based check alone. Ample total_publishable_quotes + zero
+    rows -> NOT thin."""
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence,
+        rollup_header={
+            "id": "rollup-batch-1",
+            "basis": {"total_publishable_quotes": 20, "as_of": "2026-01-01T00:00:00Z"},
+            "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
+        },
+        rollup_rows=[],
+    )
+    resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
+    _wire(monkeypatch, fake_store, resp)
+
+    status, _cost, _error = synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert status == "done"
+    call = fake_store.create_synthesis_calls[0]
+    assert call["thin_data"] is False
+    assert call["payload"]["rollup"]["themes"] == []
+
+
+# ===========================================================================
+# Rollup wiring: compute called with (store_id, project_id), payload carries the
+# rollup block pinned to batch_id, prompt is grounded in the rollup's counts.
+# ===========================================================================
+
+def test_run_synthesize_computes_rollup_before_reserve_with_store_and_project_id(monkeypatch):
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(evidence=evidence, rollup_batch_id="batch-xyz")
     resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
     _wire(monkeypatch, fake_store, resp)
 
     synthesize.run_synthesize(_job(), "claimant-1")
 
-    assert fake_store.create_synthesis_calls[0]["thin_data"] is False
+    assert fake_store.compute_theme_rollups_calls == [("mv", "proj-1")]
+    assert fake_store.get_theme_rollup_batch_calls == ["batch-xyz"]
+
+
+def test_run_synthesize_payload_carries_rollup_block_pinned_to_batch_id(monkeypatch):
+    evidence = _publishable_set(10)
+    rollup_rows = [
+        {"theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal",
+         "member_quote_ids": ["quote-0", "quote-1"], "example_quote_ids": ["quote-0"]},
+        {"theme": "shipping", "quote_type": "praise", "count": 2, "data_density": "thin",
+         "member_quote_ids": ["quote-2"], "example_quote_ids": ["quote-2"]},
+    ]
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence, rollup_batch_id="batch-pinned",
+        rollup_header={
+            "id": "batch-pinned",
+            "basis": {"total_publishable_quotes": 20, "as_of": "2026-01-05T12:00:00Z"},
+            "computed_at": "2026-01-05T12:00:00Z", "store_id": "mv", "project_id": "proj-1",
+        },
+        rollup_rows=rollup_rows,
+    )
+    resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
+    _wire(monkeypatch, fake_store, resp)
+
+    status, _cost, _error = synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert status == "done"
+    call = fake_store.create_synthesis_calls[0]
+    rollup_block = call["payload"]["rollup"]
+    assert rollup_block["batch_id"] == "batch-pinned"
+    assert rollup_block["as_of"] == "2026-01-05T12:00:00Z"
+    assert rollup_block["total_publishable_quotes"] == 20
+    assert rollup_block["themes"] == [
+        {"theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal"},
+        {"theme": "shipping", "quote_type": "praise", "count": 2, "data_density": "thin"},
+    ]
+    assert call["schema_version"] == synthesize._SCHEMA_VERSION == 2
+
+
+def test_run_synthesize_prompt_includes_rollup_grounding_table(monkeypatch):
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence,
+        rollup_rows=[
+            {"theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal",
+             "member_quote_ids": ["quote-0"], "example_quote_ids": ["quote-0"]},
+        ],
+    )
+    resp = _FakeResponse(_pain_payload([_pain(refs=[{"kind": "voc", "id": "quote-0"}])]))
+    hooks = _wire(monkeypatch, fake_store, resp)
+
+    synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert len(hooks["anthropic_calls"]) == 1
+    sent_content = hooks["anthropic_calls"][0]["messages"][0]["content"]
+    assert "DETERMINISTIC THEME ROLLUP" in sent_content
+    assert "'fit'" in sent_content
+    assert "count=5" in sent_content
+    # The evidence block is still there too -- both data blocks reach the model.
+    assert "PUBLISHABLE EVIDENCE" in sent_content
+
+
+# ===========================================================================
+# Rollup compute/read failure -- pre-reserve failure, same class as missing params /
+# empty evidence: returns ("failed", 0, ...), nothing reserved, no paid call.
+# ===========================================================================
+
+def test_run_synthesize_rollup_compute_failure_fails_no_reserve(monkeypatch):
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence, compute_rollup_raises=RuntimeError("rpc: bad store_id"),
+    )
+    hooks = _wire(monkeypatch, fake_store, resp=None)
+
+    status, cost_cents, error = synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert status == "failed"
+    assert cost_cents == 0
+    assert "theme-rollup compute failed" in error
+    assert "bad store_id" in error
+    assert hooks["reserve_calls"] == []
+    assert hooks["anthropic_calls"] == []
+    assert fake_store.get_theme_rollup_batch_calls == []
+    assert fake_store.create_synthesis_calls == []
+
+
+def test_run_synthesize_rollup_read_failure_fails_no_reserve(monkeypatch):
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(
+        evidence=evidence, get_rollup_raises=ValueError("no batch header found"),
+    )
+    hooks = _wire(monkeypatch, fake_store, resp=None)
+
+    status, cost_cents, error = synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert status == "failed"
+    assert cost_cents == 0
+    assert "theme-rollup compute failed" in error
+    assert "no batch header found" in error
+    assert hooks["reserve_calls"] == []
+    assert hooks["anthropic_calls"] == []
+    assert fake_store.create_synthesis_calls == []
 
 
 # ===========================================================================
@@ -794,6 +1139,29 @@ def test_run_synthesize_schema_build_failure_settles_zero_then_raises(monkeypatc
     monkeypatch.setattr(synthesize, "_build_synthesis_prompt", _raising_build_prompt)
 
     with pytest.raises(TypeError, match="malformed evidence summary"):
+        synthesize.run_synthesize(_job(), "claimant-1")
+
+    assert hooks["anthropic_calls"] == []
+    assert len(hooks["settle_calls"]) == 1
+    assert hooks["settle_calls"][0]["actual_cents"] == 0
+    assert fake_store.create_synthesis_calls == []
+
+
+def test_run_synthesize_rollup_block_build_failure_settles_zero_then_raises(monkeypatch):
+    """Same guarded block, same P1 class as the schema/prompt-build failure above, but
+    for `_build_rollup_block` -- the reservation has already been made by this point (the
+    rollup READ itself succeeded back in step 3, pre-reserve), so a failure building its
+    PROMPT rendering here must still settle zero, not orphan the reservation."""
+    evidence = _publishable_set(10)
+    fake_store = _FakeSynthesizeStore(evidence=evidence)
+    hooks = _wire(monkeypatch, fake_store, resp=None)
+
+    def _raising_build_rollup_block(rollup_rows):
+        raise TypeError("malformed rollup row")
+
+    monkeypatch.setattr(synthesize, "_build_rollup_block", _raising_build_rollup_block)
+
+    with pytest.raises(TypeError, match="malformed rollup row"):
         synthesize.run_synthesize(_job(), "claimant-1")
 
     assert hooks["anthropic_calls"] == []
@@ -957,12 +1325,14 @@ def test_derive_confidence_medium_and_low():
 
 def test_worst_case_cents_covers_a_realistic_high_token_input():
     """Mirrors `worker.verify`'s own worst-case regression test: the reservation must
-    stay a genuine ceiling even for input that tokenizes at a HIGH rate, and must stay
-    within the deployed 'synthesize' price card's default ceiling (75 cents)."""
+    stay a genuine ceiling even for input that tokenizes at a HIGH rate -- INCLUDING the
+    v2.1 rollup-grounding block -- and must stay within the deployed 'synthesize' price
+    card's default ceiling (75 cents)."""
     total_capped_chars = (
         synthesize._SYSTEM_PROMPT_CHARS + synthesize._MAX_FRAMING_CHARS
-        + synthesize._MAX_EVIDENCE_BLOCK_CHARS + synthesize._SCHEMA_CHARS
-        + synthesize._PROTOCOL_OVERHEAD_CHARS
+        + synthesize._MAX_EVIDENCE_BLOCK_CHARS
+        + synthesize._MAX_ROLLUP_FRAMING_CHARS + synthesize._MAX_ROLLUP_BLOCK_CHARS
+        + synthesize._SCHEMA_CHARS + synthesize._PROTOCOL_OVERHEAD_CHARS
     )
     realistic_high_cents = synthesize._actual_cents(total_capped_chars, synthesize._MAX_TOKENS)
     worst_case = synthesize._worst_case_cents("claude-sonnet-5")
@@ -976,3 +1346,40 @@ def test_build_synthesis_prompt_truncates_summary_to_max_chars():
     prompt = synthesize._build_synthesis_prompt([_evidence_row("q1", summary=huge_summary)])
     assert ("x" * synthesize._MAX_SUMMARY_CHARS) in prompt
     assert ("x" * (synthesize._MAX_SUMMARY_CHARS + 1)) not in prompt
+
+
+def test_build_rollup_block_renders_rows():
+    rows = [
+        {"theme": "fit", "quote_type": "complaint", "count": 5, "data_density": "normal"},
+        {"theme": "shipping", "quote_type": "praise", "count": 2, "data_density": "thin"},
+    ]
+    block = synthesize._build_rollup_block(rows)
+    assert "DETERMINISTIC THEME ROLLUP" in block
+    assert "'fit'" in block and "'complaint'" in block
+    assert "count=5" in block and "(normal)" in block
+    assert "'shipping'" in block and "'praise'" in block
+    assert "count=2" in block and "(thin)" in block
+
+
+def test_build_rollup_block_handles_empty_rows():
+    block = synthesize._build_rollup_block([])
+    assert "DETERMINISTIC THEME ROLLUP" in block
+    assert "0 row(s)" in block
+
+
+def test_build_rollup_block_truncates_field_length():
+    huge_theme = "x" * (synthesize._MAX_ROLLUP_FIELD_CHARS + 50)
+    block = synthesize._build_rollup_block(
+        [{"theme": huge_theme, "quote_type": "t", "count": 1, "data_density": "thin"}]
+    )
+    assert ("x" * synthesize._MAX_ROLLUP_FIELD_CHARS) in block
+    assert ("x" * (synthesize._MAX_ROLLUP_FIELD_CHARS + 1)) not in block
+
+
+def test_build_rollup_block_caps_row_count():
+    rows = [
+        {"theme": f"theme-{i}", "quote_type": "t", "count": 1, "data_density": "thin"}
+        for i in range(synthesize._MAX_ROLLUP_ROWS_IN_PROMPT + 10)
+    ]
+    block = synthesize._build_rollup_block(rows)
+    assert block.count("- theme=") == synthesize._MAX_ROLLUP_ROWS_IN_PROMPT

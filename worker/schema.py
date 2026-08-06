@@ -177,6 +177,11 @@ PROPOSED_RESEARCH_SCHEMA = {
 # not a query-then-build pair -- `worker.synthesize` calls it directly, and prices its
 # own `json.dumps(...)` length once at import time for its worst-case cost reservation
 # (see `worker.synthesize._SCHEMA_CHARS`).
+#
+# v2.1 (migration 170 theme-rollup wiring): the MINTED payload gained a worker-assembled
+# `rollup` block (deterministic theme x quote_type -> count, `worker.synthesize.
+# _SCHEMA_VERSION` bumped 1 -> 2), but this schema -- the MODEL-facing contract -- did
+# NOT change. See `build_synthesis_schema()`'s own docstring for the split.
 # ---------------------------------------------------------------------------
 
 # The two `research_publishable_evidence` kinds a synthesis's `evidence_refs` may cite --
@@ -222,6 +227,17 @@ def build_synthesis_schema() -> dict:
     evidence it was shown (`worker.synthesize._build_synthesis_prompt`). Every object --
     including nested ones -- sets `additionalProperties: false` and lists every key it
     defines in `required`, matching this module's `build_analysis_schema()` convention.
+
+    v2.1 (migration 170 theme-rollup wiring, `worker.synthesize._SCHEMA_VERSION` bumped
+    to 2): this schema constrains ONLY the MODEL's own structured output and is
+    deliberately UNCHANGED by that bump -- it never grows a `rollup` key. The
+    deterministic, SQL-computed theme-rollup block (`store.compute_theme_rollups`/
+    `get_theme_rollup_batch`) is assembled entirely worker-side, AFTER this call
+    returns, and folded into the final `research_syntheses.payload` alongside the
+    model's validated `{title, pains}` -- the model itself never emits it, and never sees
+    a schema slot for it. The rollup's counts are instead grounded into the model's
+    NARRATIVE via the prompt (a data block, not a schema constraint) -- see
+    `worker.synthesize._build_rollup_block`.
     """
     return {
         "type": "object",

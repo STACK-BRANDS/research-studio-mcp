@@ -1312,13 +1312,17 @@ def get_voc_quote(quote_id: str) -> Optional[dict]:
 
 # ---------------------------------------------------------------------------
 # P4 PRODUCTION (the `synthesize` job) -- read back the currently-publishable evidence
-# for a store and mint a DRAFT, evidence-linked synthesis through the deployed
-# `rs_create_synthesis` RPC (migration 157). Same job-spine banner as P3 EXTRACTION /
-# P4 VERIFICATION above: neither wrapper below is best-effort. `worker.synthesize.
-# run_synthesize` depends on an honest read to know what it may cite, and an honest RPC
-# result to know whether the synthesis it built was actually minted -- silently
-# swallowing either could either cite/publish evidence nobody confirmed is publishable,
-# or hide a real infrastructure failure behind a false "nothing to synthesize".
+# for a store, compute the DETERMINISTIC theme-rollup batch that grounds the deliverable's
+# counts (`rs_compute_theme_rollups`, migration 170, LIVE), and mint a DRAFT,
+# evidence-linked synthesis through the deployed `rs_create_synthesis` RPC (migration 157).
+# Same job-spine banner as P3 EXTRACTION / P4 VERIFICATION above: none of the four
+# wrappers below is best-effort. `worker.synthesize.run_synthesize` depends on an honest
+# read to know what it may cite, an honest rollup read to know the deterministic counts/
+# thin_data it must ground the deliverable in, and an honest RPC result to know whether
+# the synthesis it built was actually minted -- silently swallowing any of these could
+# either cite/publish evidence nobody confirmed is publishable, ground a pain-map in a
+# stale or fabricated count, or hide a real infrastructure failure behind a false
+# "nothing to synthesize".
 # ---------------------------------------------------------------------------
 
 def get_publishable_evidence(store_id: str, limit: Optional[int] = None) -> list:
@@ -1416,6 +1420,74 @@ def rs_create_synthesis(
         params["p_created_by"] = created_by
     res = sb.rpc("rs_create_synthesis", params).execute()
     return res.data
+
+
+def compute_theme_rollups(store_id: str, project_id: Optional[str] = None) -> str:
+    """Call the deployed `rs_compute_theme_rollups` RPC (migration 170, LIVE): computes a
+    fresh, SEALED, deterministic theme x quote_type -> count rollup batch over `store_id`'s
+    currently-publishable VoC-quote evidence (optionally narrowed further to
+    `project_id`) and returns the new batch's id. SECURITY DEFINER; service_role has
+    EXECUTE.
+
+    Every call mints a NEW batch (never updates an existing one in place) -- this is the
+    deterministic, SQL-computed counting layer `worker.synthesize.run_synthesize` grounds
+    its pain-map's counts and `thin_data` verdict in, replacing any LLM-asserted count.
+
+    `p_project_id` is always sent, including as an explicit `None` -> SQL NULL (the RPC's
+    own documented default) -- unlike most optional params elsewhere in this module, kept
+    explicit here to match the deployed two-arg RPC contract exactly, mirroring `create_
+    voc_quote`'s/`create_finding`'s `p_capture_id` convention for the same reason.
+
+    NOT best-effort (see the job-spine banner above this section): any RPC failure (a bad
+    store_id, a DB error) propagates unchanged -- `run_synthesize` treats this the same as
+    every other pre-reserve failure: returns `("failed", 0, ...)` with nothing reserved.
+    """
+    sb = _client()
+    params = {"p_store_id": store_id, "p_project_id": project_id}
+    res = sb.rpc("rs_compute_theme_rollups", params).execute()
+    return res.data
+
+
+def get_theme_rollup_batch(batch_id: str) -> dict:
+    """Read back one theme-rollup batch minted by `compute_theme_rollups` --
+    `{"header": {...}, "rows": [...]}`.
+
+    `header` is the single `research_theme_rollup_batches` row keyed by `batch_id`
+    (`basis` jsonb -- carries `total_publishable_quotes` and `as_of` -- plus
+    `computed_at`, `store_id`, `project_id`). `rows` is every `research_theme_rollups`
+    row stamped with this `batch_id` (`theme`, `quote_type`, `count`, `data_density`,
+    `member_quote_ids`, `example_quote_ids`) -- a blank `''` `theme`/`quote_type` is the
+    untagged bucket, a legitimate row, never filtered out here.
+
+    Raises `ValueError` if no header row matches `batch_id` -- should be unreachable in
+    practice (the caller always reads back the exact id `compute_theme_rollups` itself
+    just returned), but never silently collapsed into an empty/zero-row batch, which
+    `run_synthesize`'s thin_data derivation could otherwise misread as "everything came
+    back thin" rather than "the read itself failed".
+
+    NOT best-effort (see the job-spine banner above this section): `run_synthesize`
+    derives its deterministic `thin_data` verdict and its payload's `rollup` block
+    directly from this read -- any other failure (network, auth, DB error) propagates
+    unchanged rather than being mistaken for "nothing to roll up".
+    """
+    sb = _client()
+    header_res = (
+        sb.table("research_theme_rollup_batches")
+        .select("batch_id, basis, computed_at, store_id, project_id")
+        .eq("batch_id", batch_id)
+        .limit(1)
+        .execute()
+    )
+    if not header_res.data:
+        raise ValueError(f"get_theme_rollup_batch: no batch header found for batch_id={batch_id!r}")
+
+    rows_res = (
+        sb.table("research_theme_rollups")
+        .select("theme, quote_type, count, data_density, member_quote_ids, example_quote_ids")
+        .eq("batch_id", batch_id)
+        .execute()
+    )
+    return {"header": header_res.data[0], "rows": rows_res.data or []}
 
 
 def get_finding(finding_id: str) -> Optional[dict]:
