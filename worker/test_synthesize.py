@@ -840,7 +840,7 @@ def test_run_synthesize_thin_rollup_basis_sets_thin_data_true(monkeypatch):
     fake_store = _FakeSynthesizeStore(
         evidence=evidence,
         rollup_header={
-            "id": "rollup-batch-1",
+            "batch_id": "rollup-batch-1",
             "basis": {"total_publishable_quotes": 3, "as_of": "2026-01-01T00:00:00Z"},
             "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
         },
@@ -867,7 +867,7 @@ def test_run_synthesize_all_rollup_rows_thin_sets_thin_data_true(monkeypatch):
     fake_store = _FakeSynthesizeStore(
         evidence=evidence,
         rollup_header={
-            "id": "rollup-batch-1",
+            "batch_id": "rollup-batch-1",
             "basis": {"total_publishable_quotes": 20, "as_of": "2026-01-01T00:00:00Z"},
             "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
         },
@@ -909,7 +909,7 @@ def test_run_synthesize_thin_data_ignores_zero_row_batch_vacuous_truth(monkeypat
     fake_store = _FakeSynthesizeStore(
         evidence=evidence,
         rollup_header={
-            "id": "rollup-batch-1",
+            "batch_id": "rollup-batch-1",
             "basis": {"total_publishable_quotes": 20, "as_of": "2026-01-01T00:00:00Z"},
             "computed_at": "2026-01-01T00:00:00Z", "store_id": "mv", "project_id": None,
         },
