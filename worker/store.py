@@ -173,92 +173,49 @@ def save_analysis(
         else:
             raise
     analysis_id = res.data[0]["id"]
-    # Mechanically derive research_angle_observations from this analysis's own
-    # per-ad rows (v2 spec §4.3: "derived MECHANICALLY from playbook-v2 per-ad
-    # rows at analysis-save time" -- pure code, no model, never a rollup a model
-    # writes). Best-effort: save_angle_observations never raises, so a missing
-    # table or bad row shape cannot fail this save.
-    playbook = row.get("playbook") or {}
-    per_ad = playbook.get("per_ad") or []
-    save_angle_observations(analysis_id, competitor_id, per_ad)
+    # Persist research_angle_observations for this analysis. As of migration 173 the derivation,
+    # provenance-verification (every per_ad ad_id must exist in the analysis's snapshot), verbatim
+    # evidence-grading and the write itself all live in the sealed SECURITY DEFINER RPC
+    # rs_save_angle_observations(analysis_id) -- 031's hand-writable service_role path is sealed off,
+    # so the worker no longer derives or writes this table directly. The RPC reads the analysis's own
+    # playbook.per_ad, competitor_id and snapshot_id; the worker only hands it the analysis_id.
+    # Best-effort: never raises, so it cannot fail this save.
+    save_angle_observations(analysis_id)
     return analysis_id
 
 
-def save_angle_observations(
-    analysis_id: str,
-    competitor_id: str,
-    per_ad: list,
-    store_id: Optional[str] = None,
-) -> None:
-    """Group a saved analysis's playbook.per_ad rows by angle_key and insert
-    one `research_angle_observations` row per angle_key present (v2 spec
-    §4.3). Pure aggregation over rows already produced by the single
-    analyze() call -- no model, no extra Anthropic call.
+def save_angle_observations(analysis_id: str) -> None:
+    """Persist research_angle_observations for a saved analysis by calling the sealed
+    `rs_save_angle_observations(analysis_id)` RPC (migration 173).
 
-    `ad_count` = rows sharing that angle_key. `top_longevity_days` = max
-    `days_active` among them (null-safe: skips rows where it's missing/not
-    an int). `verbatim_example` = {quote, ad_ref, source_url} from one
-    representative ad in the group (the first encountered) -- `quote` is its
-    `hook` (falling back to its free-text `angle`), `ad_ref` is its `ad_id`,
-    `source_url` is None (per-ad rows carry no URL field today).
+    As of 173 all of the work -- grouping the analysis's own `playbook.per_ad` by `angle_key`,
+    provenance-verifying every cited `ad_id` against the analysis's snapshot, mechanically grading
+    each group's example hook against the ad's captured body (`evidence_grade` = body_verbatim /
+    not_body_verified), storing the full `ad_refs` membership, and the write itself -- lives inside
+    that SECURITY DEFINER function. The worker no longer derives or writes this table directly (031's
+    hand-writable service_role path is now sealed off), and it never falls back to the free-text
+    `angle` field as a fake quote. The RPC reads competitor_id / snapshot_id / per_ad from the
+    analysis row, so the worker only hands it the analysis_id. It is idempotent per analysis_id
+    (delete-then-insert under an advisory lock, inside the RPC).
 
-    `store_id` is passed through as-is (None today -- this worker doesn't
-    yet track a per-store scope for competitor teardown analyses; the column
-    is nullable for exactly this reason).
-
-    Idempotent per analysis_id: deletes any existing observations for this
-    analysis_id before inserting, so a re-run that reuses an analysis_id
-    (shouldn't happen -- each run gets a fresh one -- but cheap to guard)
-    doesn't double-count.
-
-    Best-effort, same "never break the worker" contract as start_run/
-    finish_run: ANY failure (table not yet migrated, network blip, angle_key
-    not in the registry, ...) is logged and swallowed, never raised. A
-    missing table or failed insert must not fail the analysis save.
+    Best-effort: still NEVER raises -- the analysis save must survive. But a failure here is now
+    logged at ERROR, not WARNING: after 173's seal the direct write path is gone, so a failed RPC
+    call means angle intelligence has silently stopped accruing (bad provenance, a null snapshot, a
+    transient DB error, ...). That is a contract breach worth an alert, not routine noise.
     """
     try:
-        groups: dict[str, list] = {}
-        for ad_row in per_ad:
-            if not isinstance(ad_row, dict):
-                continue
-            angle_key = ad_row.get("angle_key") or "unmapped"
-            groups.setdefault(angle_key, []).append(ad_row)
-
-        observations = []
-        for angle_key, rows in groups.items():
-            longevities = [
-                r["days_active"] for r in rows
-                if isinstance(r.get("days_active"), int) and not isinstance(r.get("days_active"), bool)
-            ]
-            top_longevity = max(longevities) if longevities else None
-            example = rows[0]
-            observations.append({
-                "analysis_id": analysis_id,
-                "competitor_id": competitor_id,
-                "store_id": store_id,
-                "angle_key": angle_key,
-                "ad_count": len(rows),
-                "top_longevity_days": top_longevity,
-                "verbatim_example": {
-                    "quote": example.get("hook") or example.get("angle") or "",
-                    "ad_ref": example.get("ad_id"),
-                    "source_url": None,
-                },
-            })
-
         sb = _client()
-        # Idempotency: clear any pre-existing observations for this
-        # analysis_id first (see docstring).
-        # Delete-then-insert runs even when there are no observations (empty
-        # per_ad): an empty re-save must still clear any stale rows, honouring
-        # the per-analysis_id idempotency contract (Terra P1). Insert only when
-        # there is something to write (an empty insert is a needless call).
-        sb.table("research_angle_observations").delete().eq("analysis_id", analysis_id).execute()
-        if observations:
-            sb.table("research_angle_observations").insert(observations).execute()
+        res = sb.rpc("rs_save_angle_observations", {"p_analysis_id": analysis_id}).execute()
+        written = res.data if isinstance(getattr(res, "data", None), int) else None
+        logger.info(
+            "save_angle_observations: rs_save_angle_observations wrote %s row(s) for analysis_id=%s",
+            written, analysis_id,
+        )
     except Exception as exc:  # noqa: BLE001 — best-effort, must never raise
-        logger.warning(
-            "save_angle_observations: could not derive/save angle observations for analysis_id=%s (%s)",
+        logger.error(
+            "save_angle_observations: rs_save_angle_observations FAILED for analysis_id=%s (%s) -- "
+            "angle observations did NOT persist; after migration 173 the direct write path is sealed, "
+            "so this is a contract breach (angle intel not accruing), not routine noise",
             analysis_id, exc,
         )
 
